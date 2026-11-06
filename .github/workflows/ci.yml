@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      # Builds packages/shared first, then type-checks every workspace.
+      - run: npm run typecheck
+      - name: Check migrations match the schema
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain -- apps/api/drizzle)" ]; then
+            git status --short -- apps/api/drizzle
+            echo "Schema changed without a migration. Run npm run db:generate."
+            exit 1
+          fi
+      # Testcontainers uses the Docker daemon on the runner for Postgres/Redis.
+      - run: npm test
+      - run: npm run build
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

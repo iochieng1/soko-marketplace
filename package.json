@@ -1,0 +1,38 @@
+{
+  "name": "soko-marketplace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless e-commerce marketplace for Kenyan sellers with M-Pesa checkout.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "packages/shared",
+    "apps/api",
+    "apps/storefront"
+  ],
+  "scripts": {
+    "dev:api": "npm run build -w @soko/shared && npm run dev -w @soko/api",
+    "dev:storefront": "npm run build -w @soko/shared && npm run dev -w @soko/storefront",
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run build -w @soko/shared && npm run typecheck --workspaces",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run build -w @soko/shared && npm run test --workspaces --if-present",
+    "db:generate": "npm run db:generate -w @soko/api",
+    "db:migrate": "npm run db:migrate -w @soko/api",
+    "db:seed": "npm run db:seed -w @soko/api"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "prettier": "^3.9.10",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.1.0"
+  }
+}
