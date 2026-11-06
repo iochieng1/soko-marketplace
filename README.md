@@ -10,7 +10,7 @@
 
 Soko ("market" in Swahili) lets small Kenyan sellers list products and get paid by M-Pesa. The API is headless: the Next.js storefront in this repo is one client, and any other frontend can use the same API.
 
-Payments go through PayBridge, a separate M-Pesa gateway API I am building alongside this one. Soko asks PayBridge to start an STK push, then receives HMAC-SHA256 signed webhooks when the payment succeeds or fails.
+Payments go through [PayBridge](https://github.com/iochieng1/paybridge), a separate M-Pesa gateway API I am building alongside this one. Soko asks PayBridge to start an STK push, then receives HMAC-SHA256 signed webhooks when the payment succeeds or fails.
 
 The hard part of a marketplace isn't listing products. It's making sure that when the last item gets two checkouts in the same second, and one M-Pesa prompt is ignored, exactly one customer gets it and the stock count is still right afterwards.
 
