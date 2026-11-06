@@ -1,5 +1,7 @@
 # Soko
 
+[![CI](https://github.com/iochieng1/soko-marketplace/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iochieng1/soko-marketplace/actions/workflows/ci.yml)
+
 **A headless e-commerce marketplace for Kenyan sellers, with M-Pesa checkout, that can't oversell stock.**
 
 > 🚧 Work in progress. Day 1: monorepo scaffold, database schema, health checks, product listing, CI.
