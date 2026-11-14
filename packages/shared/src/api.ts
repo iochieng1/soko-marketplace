@@ -1,10 +1,16 @@
 import { z } from "zod";
 
 import { paginatedSchema } from "./pagination.js";
-import { productSchema } from "./products.js";
+import { productSchema, sellerProductSchema } from "./products.js";
 
 export const productListResponseSchema = paginatedSchema(productSchema);
 export type ProductListResponse = z.infer<typeof productListResponseSchema>;
+
+export const sellerProductListResponseSchema =
+  paginatedSchema(sellerProductSchema);
+export type SellerProductListResponse = z.infer<
+  typeof sellerProductListResponseSchema
+>;
 
 const checkResultSchema = z.enum(["ok", "error"]);
 
