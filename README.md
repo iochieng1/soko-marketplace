@@ -4,7 +4,7 @@
 
 **A headless e-commerce marketplace for Kenyan sellers, with M-Pesa checkout, that can't oversell stock.**
 
-> 🚧 Work in progress. Day 1: monorepo scaffold, database schema, health checks, product listing, CI.
+> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard.
 >
 > <!-- TODO: demo GIF here once checkout works -->
 >
@@ -25,8 +25,9 @@ The hard part of a marketplace isn't listing products. It's making sure that whe
 - [x] `GET /v1/products`: active products, keyset-paginated, plus a seed script
 - [x] Storefront product listing with empty and error states
 - [x] CI: lint, format, typecheck, migration drift check, integration tests on real Postgres/Redis, builds, secret scanning
-- [ ] Seller auth
-- [ ] Product CRUD for sellers
+- [x] Seller auth: argon2id passwords, 15-minute access JWTs, rotating refresh tokens with reuse detection
+- [x] Product CRUD for sellers, unique slugs, stock edits guarded by the DB constraint
+- [x] Catalogue search, product detail pages and a seller dashboard
 - [ ] Cart
 - [ ] Checkout with stock reservations (`SELECT … FOR UPDATE` / conditional `UPDATE`)
 - [ ] Reservation expiry sweeper
@@ -49,6 +50,29 @@ npm run db:seed          # a demo seller and a few sample products
 npm run dev:api          # http://localhost:4000/health, /v1/products
 npm run dev:storefront   # http://localhost:3001 (in another terminal)
 ```
+
+The seed creates a demo seller for the dashboard at http://localhost:3001/seller/products: `duka@example.co.ke` / `soko-demo-1234`.
+
+## API
+
+All bodies are JSON. Errors use one envelope: `{ "error": { "code", "message", "details?" } }`.
+
+| Endpoint                        | Auth   | What it does                                                               |
+| ------------------------------- | ------ | -------------------------------------------------------------------------- |
+| `GET /health`                   |        | Checks Postgres and Redis                                                  |
+| `GET /v1/products?q=&cursor=`   |        | Active products, newest first, keyset-paginated, title search              |
+| `GET /v1/products/:slug`        |        | One active product with `available` stock; drafts and archived are `404`   |
+| `POST /v1/auth/register`        |        | Create a seller; `409 EMAIL_TAKEN` for a duplicate email in any case       |
+| `POST /v1/auth/login`           |        | Returns `access_token` (15 min) and `refresh_token`                        |
+| `POST /v1/auth/refresh`         |        | Swaps a refresh token for a new pair; a replayed token revokes the session |
+| `POST /v1/auth/logout`          |        | Revokes the session the refresh token belongs to                           |
+| `GET /v1/auth/me`               | Bearer | The logged-in seller                                                       |
+| `GET /v1/seller/products`       | Bearer | The seller's own products in every status, with stock                      |
+| `POST /v1/seller/products`      | Bearer | Create a product (`DRAFT` or `ACTIVE`) with its starting stock             |
+| `GET /v1/seller/products/:id`   | Bearer | One of the seller's products; anyone else's is `404`                       |
+| `PATCH /v1/seller/products/:id` | Bearer | Edit title, description, price, status (`ARCHIVED` to archive), `on_hand`  |
+
+Lowering `on_hand` below the stock reserved by unpaid orders returns `409 STOCK_BELOW_RESERVED`.
 
 ## Scripts
 
@@ -82,13 +106,16 @@ apps/
         client.ts       # Postgres connection
         migrate.ts      # Migration runner
         seed.ts         # Sample data
+      auth/             # Password hashing, JWT plugin, refresh-token rotation
       routes/           # HTTP routes
     drizzle/            # Generated SQL migrations (committed)
     test/               # Vitest + Testcontainers integration tests
     Dockerfile          # Build from the repo root
   storefront/           # Next.js (App Router) + Tailwind storefront
-    app/                # Pages
+    app/                # Pages: catalogue, product detail, seller login/register/dashboard
     lib/api.ts          # Typed API client (validates responses with shared schemas)
+    lib/session*.ts     # httpOnly session cookies
+    proxy.ts            # Refreshes the seller's access token before /seller pages render
 packages/
   shared/               # zod schemas + TS types for the API contract
 ```
@@ -105,6 +132,13 @@ Decisions and the reasons for them. This section grows as features land.
 - **M-Pesa via PayBridge, not Stripe.** The target market is Kenya, where M-Pesa is how people pay online and card ownership is low. A card-first processor like Stripe would add friction for most buyers, while M-Pesa collection goes through Safaricom's Daraja API. Calling PayBridge keeps Daraja's quirks (STK timeouts, duplicate callbacks, token expiry) out of the marketplace. Soko only has to verify signed webhooks and dedupe them (`processed_webhooks`).
 - **Keyset pagination over `OFFSET`.** The catalogue is ordered by `(created_at, id)` and the cursor encodes the last row. Pages stay fast as the table grows, and nothing gets skipped or repeated when products are added between page loads.
 - **Tests run against real Postgres and Redis (Testcontainers), not mocks.** The guarantees here come from constraints, row locks and transactions. Mocks would test none of them.
+- **Short access tokens plus rotating refresh tokens, over long-lived JWTs.** A JWT can't be revoked before it expires, so access tokens last 15 minutes. Refresh tokens are random, stored only as SHA-256 hashes, single use, and grouped into a family per login. If a token that was already used shows up again, someone holds a copy, so the whole family is revoked. The cost: two refreshes racing with the same token (two tabs at the exact moment the access token expires) log the seller out. That is safer than the alternative and rare enough to accept for now.
+- **argon2id with OWASP's baseline parameters (19 MiB, t=2, p=1).** Memory-hard, so GPU cracking of a leaked table is expensive. The parameters are stored in each hash, so they can be raised later without a migration. Login runs a real verify even for an unknown email, so timing doesn't reveal which emails have accounts.
+- **Another seller's product is `404`, not `403`.** Every seller query is scoped by `seller_id` in SQL. A `403` would confirm the id exists, letting anyone probe other sellers' catalogues.
+- **Lowering stock is checked by the database, not by reading `reserved` first.** The seller's `PATCH` just writes `on_hand`, and the `reserved <= on_hand` CHECK rejects it if unpaid orders hold more. A read-then-write check could pass and then lose to a checkout reserving stock in between.
+- **Slugs are unique, generated once and never changed.** Editing a title keeps the old slug, so links that have been shared keep working. A clash gets a random suffix, and the unique constraint (not a `SELECT` beforehand) decides who gets the clean slug.
+- **Tokens in httpOnly cookies, refreshed in `proxy.ts`.** The storefront never exposes tokens to browser JavaScript. Server Components can't set cookies, so the Next.js proxy refreshes an expired access token before a `/seller` page renders.
+- **Title search is `ILIKE`, for now.** It's a scan over active products, which is fine at this size. A `pg_trgm` GIN index is the next step if the catalogue grows.
 - **Monorepo with a shared zod contract.** The API and storefront import the same schemas, so a breaking change to a response shape fails the typecheck instead of the storefront at runtime.
 
 ## Deployment
