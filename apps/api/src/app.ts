@@ -7,6 +7,7 @@ import { createDb, type Database } from "./db/client.js";
 import authRoutes from "./routes/auth.js";
 import healthRoutes from "./routes/health.js";
 import productRoutes from "./routes/products.js";
+import sellerProductRoutes from "./routes/seller-products.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -48,6 +49,7 @@ export const buildApp = async (config: Config) => {
   await app.register(healthRoutes);
   await app.register(authRoutes, { prefix: "/v1" });
   await app.register(productRoutes, { prefix: "/v1" });
+  await app.register(sellerProductRoutes, { prefix: "/v1" });
 
   return app;
 };

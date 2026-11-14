@@ -1,9 +1,13 @@
-import { productListResponseSchema } from "@soko/shared";
+import {
+  productDetailSchema,
+  productListResponseSchema,
+  sellerProductSchema,
+} from "@soko/shared";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { buildApp } from "../src/app.js";
 import { seedDatabase } from "../src/db/seed.js";
-import { buildTestApp } from "./helpers.js";
+import { buildTestApp, registerSeller } from "./helpers.js";
 
 type App = Awaited<ReturnType<typeof buildApp>>;
 
@@ -89,5 +93,75 @@ describe("GET /v1/products", () => {
 
     expect(res.statusCode).toBe(400);
     expect(res.json()).toMatchObject({ error: { code: "BAD_REQUEST" } });
+  });
+
+  it("searches titles case-insensitively, treating wildcards literally", async () => {
+    const coffee = await list("?q=COFFEE");
+    expect(coffee.res.statusCode).toBe(200);
+    expect(coffee.body.data.map((p) => p.slug)).toEqual([
+      "kenya-aa-coffee-500g",
+    ]);
+
+    // "%" must not act as a LIKE wildcard that matches everything.
+    expect((await list("?q=%25")).body.data).toEqual([]);
+    expect((await list("?q=_")).body.data).toEqual([]);
+    // Drafts are not searchable either.
+    expect((await list("?q=soapstone")).body.data).toEqual([]);
+  });
+
+  describe("GET /v1/products/:slug", () => {
+    const detail = (slug: string) =>
+      app.inject({ method: "GET", url: `/v1/products/${slug}` });
+
+    it("returns an active product with available stock", async () => {
+      const res = await detail("sisal-kiondo-basket");
+
+      expect(res.statusCode).toBe(200);
+      expect(productDetailSchema.parse(res.json())).toMatchObject({
+        slug: "sisal-kiondo-basket",
+        price: 2500,
+        available: 8,
+      });
+    });
+
+    it("404s for drafts and for slugs that don't exist", async () => {
+      for (const slug of ["soapstone-elephant-carving", "no-such-product"]) {
+        const res = await detail(slug);
+        expect(res.statusCode).toBe(404);
+        expect(res.json()).toMatchObject({ error: { code: "NOT_FOUND" } });
+      }
+    });
+
+    it("hides a product from the public API once it's archived", async () => {
+      const { auth } = await registerSeller(app);
+      const created = await app.inject({
+        method: "POST",
+        url: "/v1/seller/products",
+        headers: auth,
+        payload: {
+          title: "Lamu dhow model",
+          price: 4000,
+          status: "ACTIVE",
+          on_hand: 1,
+        },
+      });
+      const product = sellerProductSchema.parse(created.json());
+
+      expect((await detail(product.slug)).statusCode).toBe(200);
+      expect((await list("?q=dhow")).body.data).toHaveLength(1);
+
+      await app.inject({
+        method: "PATCH",
+        url: `/v1/seller/products/${product.id}`,
+        headers: auth,
+        payload: { status: "ARCHIVED" },
+      });
+
+      expect((await detail(product.slug)).statusCode).toBe(404);
+      expect((await list("?q=dhow")).body.data).toEqual([]);
+      expect(
+        (await list("?limit=100")).body.data.map((p) => p.id),
+      ).not.toContain(product.id);
+    });
   });
 });
