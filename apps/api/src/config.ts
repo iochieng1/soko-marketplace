@@ -11,6 +11,11 @@ const envSchema = z.object({
     .default("info"),
   DATABASE_URL: z.url(),
   REDIS_URL: z.url(),
+  // HS256 signing key for access tokens. 32+ chars: a short HMAC secret can be
+  // brute-forced offline from any token.
+  JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
+  ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+  REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
 });
 
 export type Config = z.infer<typeof envSchema>;

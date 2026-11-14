@@ -1,8 +1,10 @@
 import Fastify from "fastify";
 import { Redis } from "ioredis";
 
+import { jwtPlugin } from "./auth/authenticate.js";
 import type { Config } from "./config.js";
 import { createDb, type Database } from "./db/client.js";
+import authRoutes from "./routes/auth.js";
 import healthRoutes from "./routes/health.js";
 import productRoutes from "./routes/products.js";
 
@@ -24,6 +26,8 @@ export const buildApp = async (config: Config) => {
           : undefined,
       redact: [
         "req.headers.authorization",
+        "req.body.password",
+        "req.body.refresh_token",
         "req.headers['x-paybridge-signature']",
       ],
     },
@@ -40,7 +44,9 @@ export const buildApp = async (config: Config) => {
     await Promise.allSettled([sql.end(), redis.quit()]);
   });
 
+  await app.register(jwtPlugin);
   await app.register(healthRoutes);
+  await app.register(authRoutes, { prefix: "/v1" });
   await app.register(productRoutes, { prefix: "/v1" });
 
   return app;

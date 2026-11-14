@@ -63,10 +63,43 @@ export const sellers = pgTable(
     email: text("email").notNull(),
     // Normalised to 2547XXXXXXXX / 2541XXXXXXXX (M-Pesa MSISDN format).
     phone: text("phone").notNull(),
+    // argon2id PHC string ($argon2id$v=19$m=...,t=...,p=...$salt$hash), so the
+    // parameters travel with the hash and can be raised without a migration.
+    passwordHash: text("password_hash").notNull(),
     createdAt: createdAt(),
   },
   // Case-insensitive uniqueness: Jane@x.com and jane@x.com are one seller.
   (t) => [uniqueIndex("sellers_email_lower_idx").on(sql`lower(${t.email})`)],
+);
+
+/**
+ * Refresh tokens, rotated on every use.
+ *
+ * Only a SHA-256 of the token is stored: a leaked table can't be replayed.
+ * (A fast hash is fine here, unlike passwords, because the token is 256 random
+ * bits and can't be brute-forced.)
+ *
+ * Every token descends from one login and shares that login's `family_id`.
+ * Refreshing marks the presented token used and issues its successor. If a
+ * token that was already used is presented again, either the client or an
+ * attacker holds a stolen copy, and we can't tell which, so the whole family
+ * is revoked and the seller has to log in again.
+ */
+export const refreshTokens = pgTable(
+  "refresh_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sellerId: uuid("seller_id")
+      .notNull()
+      .references(() => sellers.id, { onDelete: "cascade" }),
+    familyId: uuid("family_id").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: createdAt(),
+  },
+  (t) => [index("refresh_tokens_family_idx").on(t.familyId)],
 );
 
 export const products = pgTable(
