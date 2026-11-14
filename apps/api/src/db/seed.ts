@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 
+import { hashPassword } from "../auth/password.js";
 import { loadConfig } from "../config.js";
 import { createDb, type Database } from "./client.js";
 import { inventory, products, sellers } from "./schema.js";
@@ -48,14 +49,31 @@ const sampleProducts = [
   },
 ] as const;
 
+// Local demo login for the seller dashboard. Never used outside dev.
+export const DEMO_SELLER = {
+  email: "duka@example.co.ke",
+  password: "soko-demo-1234",
+};
+
 /** Inserts a demo seller with sample products. Safe to run repeatedly. */
 export const seedDatabase = async (db: Database) => {
+  const passwordHash = await hashPassword(DEMO_SELLER.password);
   await db.transaction(async (tx) => {
-    const email = "duka@example.co.ke";
+    const { email } = DEMO_SELLER;
     await tx
       .insert(sellers)
-      .values({ name: "Duka la Mama Wanjiku", email, phone: "254712345678" })
+      .values({
+        name: "Duka la Mama Wanjiku",
+        email,
+        phone: "254712345678",
+        passwordHash,
+      })
       .onConflictDoNothing();
+    // Also (re)sets the password on a seller seeded before auth existed.
+    await tx
+      .update(sellers)
+      .set({ passwordHash })
+      .where(sql`lower(${sellers.email}) = ${email}`);
     const [seller] = await tx
       .select({ id: sellers.id })
       .from(sellers)
@@ -96,6 +114,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     await seedDatabase(db);
     console.log(`Seeded ${sampleProducts.length} sample products`);
+    console.log(
+      `Demo seller login: ${DEMO_SELLER.email} / ${DEMO_SELLER.password}`,
+    );
   } finally {
     await client.end();
   }

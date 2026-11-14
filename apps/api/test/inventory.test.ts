@@ -44,6 +44,7 @@ describe("inventory CHECK constraints (last line of defence against oversell)", 
         name: "Constraint Test Seller",
         email: `inventory-${randomUUID()}@example.co.ke`,
         phone: "254700000000",
+        passwordHash: "!",
       })
       .returning();
     // DRAFT so it never shows up in the public catalogue tests.
