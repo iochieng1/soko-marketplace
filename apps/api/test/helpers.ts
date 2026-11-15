@@ -1,8 +1,10 @@
 import { authResponseSchema } from "@soko/shared";
+import postgres from "postgres";
 import { inject } from "vitest";
 
 import { buildApp } from "../src/app.js";
 import { type Config, loadConfig } from "../src/config.js";
+import { runMigrations } from "../src/db/migrate.js";
 
 export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   ...loadConfig({
@@ -44,4 +46,24 @@ export const registerSeller = async (
     ...body,
     auth: { authorization: `Bearer ${body.access_token}` },
   };
+};
+
+/**
+ * Creates and migrates a fresh database in the shared test container and
+ * returns its URL. For test files that publish ACTIVE products: the catalogue
+ * tests assert on exactly what the shared database lists publicly.
+ */
+export const createIsolatedDatabase = async (): Promise<string> => {
+  const baseUrl = inject("databaseUrl");
+  const name = `test_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = postgres(baseUrl, { max: 1, onnotice: () => {} });
+  try {
+    await admin.unsafe(`create database "${name}"`);
+  } finally {
+    await admin.end();
+  }
+  const url = new URL(baseUrl);
+  url.pathname = `/${name}`;
+  await runMigrations(url.toString());
+  return url.toString();
 };
