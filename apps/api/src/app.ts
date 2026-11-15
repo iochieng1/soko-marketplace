@@ -6,6 +6,7 @@ import type { Config } from "./config.js";
 import { createDb, type Database } from "./db/client.js";
 import authRoutes from "./routes/auth.js";
 import cartRoutes from "./routes/cart.js";
+import checkoutRoutes from "./routes/checkout.js";
 import healthRoutes from "./routes/health.js";
 import productRoutes from "./routes/products.js";
 import sellerProductRoutes from "./routes/seller-products.js";
@@ -52,6 +53,7 @@ export const buildApp = async (config: Config) => {
   await app.register(productRoutes, { prefix: "/v1" });
   await app.register(sellerProductRoutes, { prefix: "/v1" });
   await app.register(cartRoutes, { prefix: "/v1" });
+  await app.register(checkoutRoutes, { prefix: "/v1" });
 
   return app;
 };

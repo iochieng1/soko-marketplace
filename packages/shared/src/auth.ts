@@ -2,9 +2,9 @@ import { z } from "zod";
 
 import { normalizeKenyanPhone } from "./phone.js";
 
-const emailSchema = z.string().trim().max(254).pipe(z.email());
+export const emailSchema = z.string().trim().max(254).pipe(z.email());
 
-const phoneSchema = z.string().transform((value, ctx) => {
+export const phoneSchema = z.string().transform((value, ctx) => {
   const phone = normalizeKenyanPhone(value);
   if (!phone) {
     ctx.addIssue({

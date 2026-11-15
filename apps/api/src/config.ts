@@ -16,6 +16,9 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(900),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  // How long checkout holds stock for an unpaid order. Long enough to answer
+  // an M-Pesa prompt, short enough that abandoned checkouts free stock soon.
+  RESERVATION_TTL_SECONDS: z.coerce.number().int().positive().default(600),
 });
 
 export type Config = z.infer<typeof envSchema>;
