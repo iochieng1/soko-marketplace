@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { emailSchema, phoneSchema } from "./auth.js";
 import { MAX_PRICE_KES } from "./products.js";
 
 /** Most of one product a single order can hold. */
@@ -76,3 +77,55 @@ export const cartQuoteSchema = z.object({
   can_checkout: z.boolean(),
 });
 export type CartQuote = z.infer<typeof cartQuoteSchema>;
+
+/** `POST /v1/checkout` (send an `Idempotency-Key` header too). */
+export const checkoutRequestSchema = z.object({
+  customer_email: emailSchema,
+  // The M-Pesa number to send the payment prompt to.
+  customer_phone: phoneSchema,
+  items: cartItemsSchema,
+});
+export type CheckoutRequest = z.input<typeof checkoutRequestSchema>;
+
+/**
+ * Client-generated, unique per order attempt (a UUID is ideal). Retrying with
+ * the same key returns the original order instead of placing a second one.
+ */
+export const idempotencyKeySchema = z
+  .string()
+  .min(8)
+  .max(255)
+  .regex(/^[\x21-\x7e]+$/, "Use printable ASCII without spaces");
+
+export const orderStatusSchema = z.enum([
+  "PENDING_PAYMENT",
+  "PAID",
+  "CANCELLED",
+  "EXPIRED",
+  "FULFILLED",
+]);
+export type OrderStatus = z.infer<typeof orderStatusSchema>;
+
+export const orderItemSchema = z.object({
+  product_id: z.uuid(),
+  title: z.string(),
+  quantity: z.number().int().positive(),
+  // Price snapshot at checkout, in whole KES.
+  unit_price: z.number().int().positive(),
+  line_total: z.number().int().positive(),
+});
+export type OrderItem = z.infer<typeof orderItemSchema>;
+
+export const orderSchema = z.object({
+  id: z.uuid(),
+  status: orderStatusSchema,
+  customer_email: z.string(),
+  customer_phone: z.string(),
+  items: z.array(orderItemSchema),
+  total: z.number().int().positive(),
+  currency: z.literal("KES"),
+  // Pay before this or the reserved stock is released.
+  reserved_until: z.iso.datetime({ offset: true }),
+  created_at: z.iso.datetime({ offset: true }),
+});
+export type Order = z.infer<typeof orderSchema>;

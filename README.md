@@ -4,7 +4,7 @@
 
 **A headless e-commerce marketplace for Kenyan sellers, with M-Pesa checkout, that can't oversell stock.**
 
-> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard, cart.
+> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard, cart, checkout with stock reservations.
 >
 > <!-- TODO: demo GIF here once checkout works -->
 >
@@ -29,7 +29,7 @@ The hard part of a marketplace isn't listing products. It's making sure that whe
 - [x] Product CRUD for sellers, unique slugs, stock edits guarded by the DB constraint
 - [x] Catalogue search, product detail pages and a seller dashboard
 - [x] Cart in local storage, priced by `POST /v1/cart/quote`
-- [ ] Checkout with stock reservations (`SELECT … FOR UPDATE` / conditional `UPDATE`)
+- [x] Idempotent checkout that reserves stock with conditional `UPDATE`s, proven by a 50-way concurrency test
 - [ ] Reservation expiry sweeper
 - [ ] M-Pesa payment via PayBridge
 - [ ] Signed webhook verification (`X-PayBridge-Signature`) and deduplication
@@ -72,10 +72,13 @@ All bodies are JSON. Errors use one envelope: `{ "error": { "code", "message", "
 | `GET /v1/seller/products/:id`   | Bearer | One of the seller's products; anyone else's is `404`                       |
 | `PATCH /v1/seller/products/:id` | Bearer | Edit title, description, price, status (`ARCHIVED` to archive), `on_hand`  |
 | `POST /v1/cart/quote`           |        | Current prices, stock and total for a cart; flags problems per line        |
+| `POST /v1/checkout`             |        | Place an order and reserve its stock; needs an `Idempotency-Key` header    |
 
 Lowering `on_hand` below the stock reserved by unpaid orders returns `409 STOCK_BELOW_RESERVED`.
 
 **Cart quote.** Send `{ "items": [{ "product_id", "quantity", "expected_price?" }] }`. Each line comes back with the server's `unit_price`, `available` stock and `issues`: `UNAVAILABLE` (missing, draft or archived), `OUT_OF_STOCK`, `INSUFFICIENT_STOCK`, or `PRICE_CHANGED` (differs from `expected_price`). `can_checkout` is false if any line is unavailable or short, or the total is over M-Pesa's KES 250,000 limit. A price change alone doesn't block checkout.
+
+**Checkout.** Send `customer_email`, `customer_phone` (the M-Pesa number) and the same `items`, with a unique `Idempotency-Key` header (a UUID). It returns `201` with a `PENDING_PAYMENT` order whose stock is held until `reserved_until` (10 minutes). Retrying with the same key returns the same order with `200`; reusing the key for a different cart or customer is `422 IDEMPOTENCY_KEY_REUSED`. Failures roll back everything: `409 OUT_OF_STOCK`, `409 PRICE_CHANGED` (a stale `expected_price`), `409 PRODUCT_UNAVAILABLE`, `422 ORDER_TOTAL_TOO_LARGE`.
 
 ## Scripts
 
@@ -129,7 +132,8 @@ packages/
 Decisions and the reasons for them. This section grows as features land.
 
 - **Reserve stock at checkout, not decrement at payment.** M-Pesa payment is asynchronous: the customer gets an STK prompt on their phone and may take 30+ seconds to enter a PIN, or ignore it. If stock were only decremented when payment succeeds, two customers could both pay for the last item and one would need a refund. Reserving at checkout means a customer is only asked to pay for stock that is held for them. The cost is that abandoned checkouts hold stock, which is why reservations expire and a sweeper releases them.
-- **Conditional `UPDATE` over `SELECT … FOR UPDATE` for reserving.** `UPDATE inventory SET reserved = reserved + $q WHERE product_id = $id AND reserved + $q <= on_hand` checks and reserves in one atomic statement. Zero rows updated means out of stock. It holds a row lock only for that statement, needs no extra round trip, and has no read-then-write window. `SELECT … FOR UPDATE` is still the right tool when a decision needs several rows read first (for example, locking a multi-item cart's rows in a consistent order to avoid deadlocks), so checkout may use both.
+- **Conditional `UPDATE` over `SELECT … FOR UPDATE` for reserving.** Checkout runs `UPDATE inventory SET reserved = reserved + $q WHERE product_id = $id AND on_hand - reserved >= $q` for each line, which checks and reserves in one atomic statement; zero rows updated means out of stock and the whole order rolls back. With `SELECT … FOR UPDATE` you lock the row, read the stock, decide in application code, then write: one more round trip per line, the lock held across all of it, and correctness depends on every caller remembering to take the lock first. Forget it once and two plain reads can both see the last unit. The conditional `UPDATE` can't be used wrongly that way. When two checkouts hit the same row, Postgres makes the second wait, then re-checks its `WHERE` against the committed row (READ COMMITTED re-evaluation), so the last unit is reserved exactly once. A multi-item checkout still takes several row locks, so lines are reserved in product-id order: two carts with the same products can't each hold a row the other needs, so there's no deadlock. `test/checkout.test.ts` fires 50 parallel checkouts at 10 units and expects exactly 10 orders and 40 `409`s, plus a mixed-order cart test for deadlocks. `SELECT … FOR UPDATE` is the better tool when the decision needs more than one row's state, which reserving doesn't.
+- **Idempotency key on the order row, checked against the request.** The order is inserted before any stock is touched, so a retry racing its original blocks on the `idempotency_key` unique index and, once the original commits, rolls back and returns that order. A replay only succeeds if the email, phone and items match. Otherwise anyone who guessed or saw a key would get someone else's order back, and a client bug that reused a key would silently get the wrong order.
 - **A database CHECK constraint as the last line of defence.** `inventory` has `CHECK (reserved >= 0 AND reserved <= on_hand)`. Application logic should never hit it. But if a bug, a missed race or a manual SQL fix tries to oversell, Postgres rejects the write and the transaction rolls back. Correctness doesn't rely on every code path being right, and there's a test that proves it.
 - **Transactional outbox over sending emails/SMS inline.** Sending a confirmation inside the payment-webhook handler gives two bad outcomes: a message for a transaction that then rolls back, or a committed order whose message is lost because the process crashed after commit. Writing an `outbox` row in the same transaction as `status = 'PAID'` makes "order paid" and "message queued" atomic. A worker sends it later, with retries. Delivery is at-least-once, so senders must tolerate duplicates.
 - **The cart is client-side; prices come from the server.** For v1 the cart lives in the browser's local storage, with no cart table. Shoppers don't need accounts. Browsing and building a cart cost the database nothing until checkout. There's no abandoned-cart data to expire. Since stock is only held at checkout, a server-side cart wouldn't hold anything anyway. The browser's copy is untrusted: `POST /v1/cart/quote` re-prices every line from the database and flags price changes and stock problems, and checkout repeats every check inside its transaction and ignores client prices except to refuse a stale one (`409 PRICE_CHANGED`). The costs: the cart doesn't follow a shopper across devices, and sellers can't see what's sitting in carts. A server-side cart is worth adding along with customer accounts.
