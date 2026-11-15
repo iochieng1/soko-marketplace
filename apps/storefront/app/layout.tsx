@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
 
+import { CartLink } from "./cart/cart-link";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -18,15 +19,18 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <Link href="/" className="text-xl font-semibold tracking-tight">
               Soko
             </Link>
-            {/* No prefetch: a prefetch can trigger a token refresh in the
-                proxy, and two racing refreshes would revoke the session. */}
-            <Link
-              href="/seller/products"
-              prefetch={false}
-              className="text-sm font-medium text-emerald-800 hover:underline"
-            >
-              Sell on Soko
-            </Link>
+            <div className="flex items-center gap-6">
+              <CartLink />
+              {/* No prefetch: a prefetch can trigger a token refresh in the
+                  proxy, and two racing refreshes would revoke the session. */}
+              <Link
+                href="/seller/products"
+                prefetch={false}
+                className="text-sm font-medium text-emerald-800 hover:underline"
+              >
+                Sell on Soko
+              </Link>
+            </div>
           </nav>
         </header>
         <main className="mx-auto max-w-5xl px-4 py-8">{children}</main>

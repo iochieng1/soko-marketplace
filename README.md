@@ -4,7 +4,7 @@
 
 **A headless e-commerce marketplace for Kenyan sellers, with M-Pesa checkout, that can't oversell stock.**
 
-> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard.
+> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard, cart.
 >
 > <!-- TODO: demo GIF here once checkout works -->
 >
@@ -28,7 +28,7 @@ The hard part of a marketplace isn't listing products. It's making sure that whe
 - [x] Seller auth: argon2id passwords, 15-minute access JWTs, rotating refresh tokens with reuse detection
 - [x] Product CRUD for sellers, unique slugs, stock edits guarded by the DB constraint
 - [x] Catalogue search, product detail pages and a seller dashboard
-- [ ] Cart
+- [x] Cart in local storage, priced by `POST /v1/cart/quote`
 - [ ] Checkout with stock reservations (`SELECT … FOR UPDATE` / conditional `UPDATE`)
 - [ ] Reservation expiry sweeper
 - [ ] M-Pesa payment via PayBridge
@@ -71,8 +71,11 @@ All bodies are JSON. Errors use one envelope: `{ "error": { "code", "message", "
 | `POST /v1/seller/products`      | Bearer | Create a product (`DRAFT` or `ACTIVE`) with its starting stock             |
 | `GET /v1/seller/products/:id`   | Bearer | One of the seller's products; anyone else's is `404`                       |
 | `PATCH /v1/seller/products/:id` | Bearer | Edit title, description, price, status (`ARCHIVED` to archive), `on_hand`  |
+| `POST /v1/cart/quote`           |        | Current prices, stock and total for a cart; flags problems per line        |
 
 Lowering `on_hand` below the stock reserved by unpaid orders returns `409 STOCK_BELOW_RESERVED`.
+
+**Cart quote.** Send `{ "items": [{ "product_id", "quantity", "expected_price?" }] }`. Each line comes back with the server's `unit_price`, `available` stock and `issues`: `UNAVAILABLE` (missing, draft or archived), `OUT_OF_STOCK`, `INSUFFICIENT_STOCK`, or `PRICE_CHANGED` (differs from `expected_price`). `can_checkout` is false if any line is unavailable or short, or the total is over M-Pesa's KES 250,000 limit. A price change alone doesn't block checkout.
 
 ## Scripts
 
@@ -112,8 +115,9 @@ apps/
     test/               # Vitest + Testcontainers integration tests
     Dockerfile          # Build from the repo root
   storefront/           # Next.js (App Router) + Tailwind storefront
-    app/                # Pages: catalogue, product detail, seller login/register/dashboard
+    app/                # Pages: catalogue, product detail, cart, seller login/register/dashboard
     lib/api.ts          # Typed API client (validates responses with shared schemas)
+    lib/cart.ts         # The cart, in local storage
     lib/session*.ts     # httpOnly session cookies
     proxy.ts            # Refreshes the seller's access token before /seller pages render
 packages/
@@ -128,6 +132,7 @@ Decisions and the reasons for them. This section grows as features land.
 - **Conditional `UPDATE` over `SELECT … FOR UPDATE` for reserving.** `UPDATE inventory SET reserved = reserved + $q WHERE product_id = $id AND reserved + $q <= on_hand` checks and reserves in one atomic statement. Zero rows updated means out of stock. It holds a row lock only for that statement, needs no extra round trip, and has no read-then-write window. `SELECT … FOR UPDATE` is still the right tool when a decision needs several rows read first (for example, locking a multi-item cart's rows in a consistent order to avoid deadlocks), so checkout may use both.
 - **A database CHECK constraint as the last line of defence.** `inventory` has `CHECK (reserved >= 0 AND reserved <= on_hand)`. Application logic should never hit it. But if a bug, a missed race or a manual SQL fix tries to oversell, Postgres rejects the write and the transaction rolls back. Correctness doesn't rely on every code path being right, and there's a test that proves it.
 - **Transactional outbox over sending emails/SMS inline.** Sending a confirmation inside the payment-webhook handler gives two bad outcomes: a message for a transaction that then rolls back, or a committed order whose message is lost because the process crashed after commit. Writing an `outbox` row in the same transaction as `status = 'PAID'` makes "order paid" and "message queued" atomic. A worker sends it later, with retries. Delivery is at-least-once, so senders must tolerate duplicates.
+- **The cart is client-side; prices come from the server.** For v1 the cart lives in the browser's local storage, with no cart table. Shoppers don't need accounts. Browsing and building a cart cost the database nothing until checkout. There's no abandoned-cart data to expire. Since stock is only held at checkout, a server-side cart wouldn't hold anything anyway. The browser's copy is untrusted: `POST /v1/cart/quote` re-prices every line from the database and flags price changes and stock problems, and checkout repeats every check inside its transaction and ignores client prices except to refuse a stale one (`409 PRICE_CHANGED`). The costs: the cart doesn't follow a shopper across devices, and sellers can't see what's sitting in carts. A server-side cart is worth adding along with customer accounts.
 - **Prices as integer whole shillings.** M-Pesa only moves whole KES, so there is no floating-point money and no cents column. `order_items.unit_price` snapshots the price at checkout.
 - **M-Pesa via PayBridge, not Stripe.** The target market is Kenya, where M-Pesa is how people pay online and card ownership is low. A card-first processor like Stripe would add friction for most buyers, while M-Pesa collection goes through Safaricom's Daraja API. Calling PayBridge keeps Daraja's quirks (STK timeouts, duplicate callbacks, token expiry) out of the marketplace. Soko only has to verify signed webhooks and dedupe them (`processed_webhooks`).
 - **Keyset pagination over `OFFSET`.** The catalogue is ordered by `(created_at, id)` and the cursor encodes the last row. Pages stay fast as the table grows, and nothing gets skipped or repeated when products are added between page loads.

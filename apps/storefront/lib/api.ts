@@ -1,5 +1,6 @@
 import {
   authResponseSchema,
+  cartQuoteSchema,
   errorResponseSchema,
   productDetailSchema,
   productListResponseSchema,
@@ -8,6 +9,8 @@ import {
   sellerSchema,
   tokenPairSchema,
   type AuthResponse,
+  type CartQuote,
+  type CartQuoteRequest,
   type CreateProductRequest,
   type LoginRequest,
   type ProductDetail,
@@ -123,6 +126,12 @@ export const fetchProduct = async (
     throw err;
   }
 };
+
+// Cart
+
+/** Current prices and stock for a cart. The client's prices aren't trusted. */
+export const quoteCart = (body: CartQuoteRequest): Promise<CartQuote> =>
+  request("/v1/cart/quote", cartQuoteSchema, { method: "POST", body });
 
 // Seller auth
 

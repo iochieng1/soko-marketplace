@@ -8,6 +8,8 @@ import { cache } from "react";
 import { ErrorState } from "@/app/components";
 import { fetchProduct } from "@/lib/api";
 
+import { AddToCart } from "./add-to-cart";
+
 type PageProps = { params: Promise<{ slug: string }> };
 
 // generateMetadata and the page both need the product: fetch it once.
@@ -62,13 +64,7 @@ export default async function ProductPage({ params }: PageProps) {
         </p>
       )}
 
-      <button
-        disabled
-        title="M-Pesa checkout is coming soon"
-        className="mt-8 rounded-md bg-emerald-700 px-6 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-      >
-        {inStock ? "Pay with M-Pesa (coming soon)" : "Sold out"}
-      </button>
+      <AddToCart product={product} />
     </article>
   );
 }
