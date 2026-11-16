@@ -1,0 +1,1 @@
+ALTER TYPE "public"."order_status" ADD VALUE 'REFUND_PENDING';

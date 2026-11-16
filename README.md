@@ -4,7 +4,7 @@
 
 **A headless e-commerce marketplace for Kenyan sellers, with M-Pesa checkout, that can't oversell stock.**
 
-> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard, cart, checkout with stock reservations.
+> 🚧 Work in progress. Done so far: monorepo scaffold, database schema, health checks, CI, seller auth, product CRUD, catalogue and product pages, seller dashboard, cart, checkout with stock reservations, reservation expiry.
 >
 > <!-- TODO: demo GIF here once checkout works -->
 >
@@ -30,7 +30,7 @@ The hard part of a marketplace isn't listing products. It's making sure that whe
 - [x] Catalogue search, product detail pages and a seller dashboard
 - [x] Cart in local storage, priced by `POST /v1/cart/quote`
 - [x] Idempotent checkout that reserves stock with conditional `UPDATE`s, proven by a 50-way concurrency test
-- [ ] Reservation expiry sweeper
+- [x] Reservation expiry sweeper (BullMQ, every minute) that never releases stock twice, and explicit handling of payments that arrive after expiry
 - [ ] M-Pesa payment via PayBridge
 - [ ] Signed webhook verification (`X-PayBridge-Signature`) and deduplication
 - [ ] Transactional outbox for confirmation emails/SMS
@@ -80,6 +80,8 @@ Lowering `on_hand` below the stock reserved by unpaid orders returns `409 STOCK_
 
 **Checkout.** Send `customer_email`, `customer_phone` (the M-Pesa number) and the same `items`, with a unique `Idempotency-Key` header (a UUID). It returns `201` with a `PENDING_PAYMENT` order whose stock is held until `reserved_until` (10 minutes). Retrying with the same key returns the same order with `200`; reusing the key for a different cart or customer is `422 IDEMPOTENCY_KEY_REUSED`. Failures roll back everything: `409 OUT_OF_STOCK`, `409 PRICE_CHANGED` (a stale `expected_price`), `409 PRODUCT_UNAVAILABLE`, `422 ORDER_TOTAL_TOO_LARGE`.
 
+**Expiry.** Every minute a BullMQ job releases the stock of orders still unpaid at `reserved_until` and marks them `EXPIRED`. If payment for an expired order arrives later, the stock is taken again if it's still there and the order becomes `PAID`; if not, the order becomes `REFUND_PENDING`.
+
 ## Scripts
 
 Run from the repository root.
@@ -113,6 +115,8 @@ apps/
         migrate.ts      # Migration runner
         seed.ts         # Sample data
       auth/             # Password hashing, JWT plugin, refresh-token rotation
+      jobs/             # BullMQ jobs (reservation expiry sweeper)
+      lib/              # Order loading, reservation sweeping, payment settlement
       routes/           # HTTP routes
     drizzle/            # Generated SQL migrations (committed)
     test/               # Vitest + Testcontainers integration tests
@@ -133,6 +137,8 @@ Decisions and the reasons for them. This section grows as features land.
 
 - **Reserve stock at checkout, not decrement at payment.** M-Pesa payment is asynchronous: the customer gets an STK prompt on their phone and may take 30+ seconds to enter a PIN, or ignore it. If stock were only decremented when payment succeeds, two customers could both pay for the last item and one would need a refund. Reserving at checkout means a customer is only asked to pay for stock that is held for them. The cost is that abandoned checkouts hold stock, which is why reservations expire and a sweeper releases them.
 - **Conditional `UPDATE` over `SELECT … FOR UPDATE` for reserving.** Checkout runs `UPDATE inventory SET reserved = reserved + $q WHERE product_id = $id AND on_hand - reserved >= $q` for each line, which checks and reserves in one atomic statement; zero rows updated means out of stock and the whole order rolls back. With `SELECT … FOR UPDATE` you lock the row, read the stock, decide in application code, then write: one more round trip per line, the lock held across all of it, and correctness depends on every caller remembering to take the lock first. Forget it once and two plain reads can both see the last unit. The conditional `UPDATE` can't be used wrongly that way. When two checkouts hit the same row, Postgres makes the second wait, then re-checks its `WHERE` against the committed row (READ COMMITTED re-evaluation), so the last unit is reserved exactly once. A multi-item checkout still takes several row locks, so lines are reserved in product-id order: two carts with the same products can't each hold a row the other needs, so there's no deadlock. `test/checkout.test.ts` fires 50 parallel checkouts at 10 units and expects exactly 10 orders and 40 `409`s, plus a mixed-order cart test for deadlocks. `SELECT … FOR UPDATE` is the better tool when the decision needs more than one row's state, which reserving doesn't.
+- **The expiry sweeper locks orders with `SKIP LOCKED` and releases only `ACTIVE` rows.** Each batch picks expired reservations through the partial index on `expires_at WHERE status = 'ACTIVE'`, locks their orders with `FOR UPDATE SKIP LOCKED`, flips `ACTIVE` reservations to `RELEASED` and gives back exactly the quantities its `RETURNING` reported, all in one transaction. Two sweepers split the work instead of fighting over it. A second run finds no `ACTIVE` rows, so stock is never released twice. A payment locks the same order row, so a payment and an expiry run one after the other, never interleaved. BullMQ's scheduler means only one instance sweeps per tick, but correctness doesn't depend on that: the tests run 8 sweepers at once, and race payments against the sweeper.
+- **A late payment re-reserves the stock if it can, otherwise it's flagged for a refund.** An M-Pesa callback can land after the order expired. Refusing the money outright would be worse than selling the stock if it's still there, so the payment takes the stock again with the same conditional `UPDATE` checkout uses, all lines or none (a savepoint). If any line has been bought by someone else, the order becomes `REFUND_PENDING`. It never takes stock that another customer is holding. Refunds are issued by hand for now.
 - **Idempotency key on the order row, checked against the request.** The order is inserted before any stock is touched, so a retry racing its original blocks on the `idempotency_key` unique index and, once the original commits, rolls back and returns that order. A replay only succeeds if the email, phone and items match. Otherwise anyone who guessed or saw a key would get someone else's order back, and a client bug that reused a key would silently get the wrong order.
 - **A database CHECK constraint as the last line of defence.** `inventory` has `CHECK (reserved >= 0 AND reserved <= on_hand)`. Application logic should never hit it. But if a bug, a missed race or a manual SQL fix tries to oversell, Postgres rejects the write and the transaction rolls back. Correctness doesn't rely on every code path being right, and there's a test that proves it.
 - **Transactional outbox over sending emails/SMS inline.** Sending a confirmation inside the payment-webhook handler gives two bad outcomes: a message for a transaction that then rolls back, or a committed order whose message is lost because the process crashed after commit. Writing an `outbox` row in the same transaction as `status = 'PAID'` makes "order paid" and "message queued" atomic. A worker sends it later, with retries. Delivery is at-least-once, so senders must tolerate duplicates.

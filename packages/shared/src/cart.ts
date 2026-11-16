@@ -103,6 +103,7 @@ export const orderStatusSchema = z.enum([
   "CANCELLED",
   "EXPIRED",
   "FULFILLED",
+  "REFUND_PENDING",
 ]);
 export type OrderStatus = z.infer<typeof orderStatusSchema>;
 

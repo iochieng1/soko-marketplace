@@ -47,6 +47,9 @@ export const orderStatus = pgEnum("order_status", [
   "CANCELLED",
   "EXPIRED",
   "FULFILLED",
+  // Paid after the order expired and its stock was sold to someone else (or
+  // the order was cancelled). The money has to go back to the customer.
+  "REFUND_PENDING",
 ]);
 
 export const reservationStatus = pgEnum("reservation_status", [
