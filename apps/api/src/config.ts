@@ -19,6 +19,12 @@ const envSchema = z.object({
   // How long checkout holds stock for an unpaid order. Long enough to answer
   // an M-Pesa prompt, short enough that abandoned checkouts free stock soon.
   RESERVATION_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+  // How often the sweeper releases stock held by expired reservations.
+  RESERVATION_SWEEP_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
 });
 
 export type Config = z.infer<typeof envSchema>;

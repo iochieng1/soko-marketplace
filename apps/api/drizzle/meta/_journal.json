@@ -15,6 +15,13 @@
       "when": 1794641729053,
       "tag": "0001_seller_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794810099271,
+      "tag": "0002_refund_pending_status",
+      "breakpoints": true
     }
   ]
 }
