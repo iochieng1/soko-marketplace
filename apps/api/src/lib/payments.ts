@@ -19,6 +19,12 @@ export type PaymentOutcome =
   /** The order was already settled; nothing changed (duplicate delivery). */
   | "ALREADY_SETTLED";
 
+export type FailureOutcome =
+  /** The order was waiting for payment; its stock is released. */
+  | "FAILED"
+  /** Nothing to do: the order was paid, expired or settled some other way. */
+  | "ALREADY_SETTLED";
+
 /** Rolls back the re-reservation savepoint when a line is out of stock. */
 class StockGone extends Error {}
 
@@ -32,7 +38,7 @@ class StockGone extends Error {}
  *     on_hand for good and stops counting as reserved. This holds even if
  *     expires_at has passed but the sweeper hasn't reached the order yet,
  *     because the stock is still held.
- *   - EXPIRED: the sweeper already gave the stock back. Try to take it again,
+ *   - EXPIRED or PAYMENT_FAILED: the stock was already given back. Try to take it again,
  *     all lines or none; if any line is short the order is flagged
  *     REFUND_PENDING and inventory is left exactly as it was.
  *   - CANCELLED: the customer paid for an order that no longer exists, so it
@@ -83,7 +89,11 @@ export const confirmPayment = async (
         return "PAID";
       }
 
-      case "EXPIRED": {
+      // PayBridge only moves forward, so success after a failure shouldn't
+      // happen; if it does, the customer paid, and is treated like a late
+      // payment.
+      case "EXPIRED":
+      case "PAYMENT_FAILED": {
         const items = await tx
           .select({
             productId: orderItems.productId,
@@ -143,4 +153,52 @@ export const confirmPayment = async (
       default:
         return "ALREADY_SETTLED";
     }
+  });
+
+/**
+ * Applies a failed, cancelled or timed-out payment: the order's held stock
+ * goes back to the pool and the order becomes PAYMENT_FAILED.
+ *
+ * Locks the order like `confirmPayment` and the sweeper, so it can't
+ * interleave with either. Only reservations still ACTIVE are released, so
+ * stock is never returned twice. Any status other than PENDING_PAYMENT is
+ * left alone: a PAID order stays paid, and an EXPIRED one has already given
+ * its stock back.
+ *
+ * Returns undefined if the order doesn't exist.
+ */
+export const failPayment = async (
+  db: Database,
+  orderId: string,
+): Promise<FailureOutcome | undefined> =>
+  db.transaction(async (tx) => {
+    const [order] = await tx
+      .select({ status: orders.status })
+      .from(orders)
+      .where(eq(orders.id, orderId))
+      .for("update");
+    if (!order) return undefined;
+    if (order.status !== "PENDING_PAYMENT") return "ALREADY_SETTLED";
+
+    const released = await tx
+      .update(stockReservations)
+      .set({ status: "RELEASED" })
+      .where(
+        and(
+          eq(stockReservations.orderId, orderId),
+          eq(stockReservations.status, "ACTIVE"),
+        ),
+      )
+      .returning({
+        productId: stockReservations.productId,
+        quantity: stockReservations.quantity,
+      });
+    await applyStockChanges(tx, released, (q) => ({
+      reserved: sql`${inventory.reserved} - ${q}`,
+    }));
+    await tx
+      .update(orders)
+      .set({ status: "PAYMENT_FAILED", updatedAt: sql`now()` })
+      .where(eq(orders.id, orderId));
+    return "FAILED";
   });

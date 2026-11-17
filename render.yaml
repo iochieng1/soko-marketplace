@@ -17,6 +17,14 @@ services:
         fromDatabase:
           name: soko-db
           property: connectionString
+      # Set these in the Render dashboard: they come from your PayBridge
+      # merchant account and must never be committed.
+      - key: PAYBRIDGE_API_URL
+        sync: false
+      - key: PAYBRIDGE_API_KEY
+        sync: false
+      - key: PAYBRIDGE_WEBHOOK_SECRET
+        sync: false
       - key: REDIS_URL
         fromService:
           type: keyvalue

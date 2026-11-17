@@ -13,6 +13,9 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
     DATABASE_URL: inject("databaseUrl"),
     REDIS_URL: inject("redisUrl"),
     JWT_SECRET: "test-only-jwt-secret-0123456789abcdef",
+    PAYBRIDGE_API_URL: inject("paybridgeUrl"),
+    PAYBRIDGE_API_KEY: inject("paybridgeApiKey"),
+    PAYBRIDGE_WEBHOOK_SECRET: "whsec_test_only",
   }),
   ...overrides,
 });

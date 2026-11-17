@@ -5,7 +5,12 @@ import {
   type Order,
 } from "@soko/shared";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import type { FastifyPluginAsync, FastifyReply } from "fastify";
+import type {
+  FastifyInstance,
+  FastifyPluginAsync,
+  FastifyReply,
+  FastifyRequest,
+} from "fastify";
 import type { z } from "zod";
 
 import {
@@ -17,6 +22,7 @@ import {
 } from "../db/schema.js";
 import { isUniqueViolation, sendError } from "../lib/errors.js";
 import { loadOrder } from "../lib/orders.js";
+import { requestPayment } from "../lib/payment-sync.js";
 
 type CheckoutBody = z.output<typeof checkoutRequestSchema>;
 
@@ -46,11 +52,33 @@ const sameRequest = (order: Order, body: CheckoutBody) => {
 };
 
 /**
+ * Asks PayBridge for the order's M-Pesa prompt, then reloads the order: if
+ * M-Pesa refused the push, it is PAYMENT_FAILED by now. On a retry this also
+ * re-requests a payment whose first request never reached PayBridge (it is
+ * idempotent on the order id, so it never sends a second prompt).
+ */
+const withPayment = async (
+  app: FastifyInstance,
+  request: FastifyRequest,
+  order: Order,
+): Promise<Order> => {
+  if (order.status !== "PENDING_PAYMENT") return order;
+  await requestPayment(app.paymentDeps(request.log), order.id);
+  return (await loadOrder(app.db, { id: order.id })) ?? order;
+};
+
+/**
  * Answers a retry with the order its key already created. The request must
  * match that order: reusing a key for a different cart is a client bug, and
  * returning someone's order for a guessed key would leak their details.
  */
-const replay = (reply: FastifyReply, order: Order, body: CheckoutBody) => {
+const replay = async (
+  app: FastifyInstance,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  order: Order,
+  body: CheckoutBody,
+) => {
   if (!sameRequest(order, body)) {
     return sendError(
       reply,
@@ -59,7 +87,10 @@ const replay = (reply: FastifyReply, order: Order, body: CheckoutBody) => {
       "This Idempotency-Key was already used for a different order",
     );
   }
-  return reply.code(200).header("idempotent-replayed", "true").send(order);
+  return reply
+    .code(200)
+    .header("idempotent-replayed", "true")
+    .send(await withPayment(app, request, order));
 };
 
 const checkoutRoutes: FastifyPluginAsync = async (app) => {
@@ -91,7 +122,7 @@ const checkoutRoutes: FastifyPluginAsync = async (app) => {
     // Fast path for a plain retry. A retry that races the original past this
     // check is caught by the unique constraint below.
     const existing = await loadOrder(app.db, { idempotencyKey });
-    if (existing) return replay(reply, existing, body.data);
+    if (existing) return replay(app, request, reply, existing, body.data);
 
     // Lock rows in one global order (product id) so two checkouts with the
     // same products can't each hold a row the other is waiting for: no
@@ -225,14 +256,17 @@ const checkoutRoutes: FastifyPluginAsync = async (app) => {
       // back without reserving anything. Answer with the order it placed.
       if (isUniqueViolation(err, "orders_idempotency_key_unique")) {
         const order = await loadOrder(app.db, { idempotencyKey });
-        if (order) return replay(reply, order, body.data);
+        if (order) return replay(app, request, reply, order, body.data);
       }
       throw err;
     }
 
-    const order = await loadOrder(app.db, { id: orderId });
-    if (!order) throw new Error("Placed order not found");
-    return reply.code(201).send(order);
+    // The stock is committed before PayBridge is called: an HTTP call must
+    // never hold row locks open. If the call fails, the order waits as
+    // PENDING_PAYMENT and a retry or status poll asks again.
+    const placed = await loadOrder(app.db, { id: orderId });
+    if (!placed) throw new Error("Placed order not found");
+    return reply.code(201).send(await withPayment(app, request, placed));
   });
 };
 

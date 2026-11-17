@@ -50,6 +50,9 @@ export const orderStatus = pgEnum("order_status", [
   // Paid after the order expired and its stock was sold to someone else (or
   // the order was cancelled). The money has to go back to the customer.
   "REFUND_PENDING",
+  // The M-Pesa payment failed, was cancelled or timed out; the stock it held
+  // has been released.
+  "PAYMENT_FAILED",
 ]);
 
 export const reservationStatus = pgEnum("reservation_status", [

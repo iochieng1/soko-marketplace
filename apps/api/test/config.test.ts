@@ -6,6 +6,9 @@ const validEnv = {
   DATABASE_URL: "postgres://u:p@localhost:5432/db",
   REDIS_URL: "redis://localhost:6379",
   JWT_SECRET: "x".repeat(32),
+  PAYBRIDGE_API_URL: "http://localhost:3100",
+  PAYBRIDGE_API_KEY: "pk_test_key",
+  PAYBRIDGE_WEBHOOK_SECRET: "whsec_test",
 };
 
 describe("loadConfig", () => {
@@ -36,7 +39,7 @@ describe("loadConfig", () => {
 
   it("fails fast and lists every missing variable", () => {
     expect(() => loadConfig({})).toThrow(
-      /DATABASE_URL[\s\S]*REDIS_URL[\s\S]*JWT_SECRET/,
+      /DATABASE_URL[\s\S]*REDIS_URL[\s\S]*JWT_SECRET[\s\S]*PAYBRIDGE_API_URL[\s\S]*PAYBRIDGE_API_KEY[\s\S]*PAYBRIDGE_WEBHOOK_SECRET/,
     );
   });
 
@@ -51,5 +54,11 @@ describe("loadConfig", () => {
       ACCESS_TOKEN_TTL_SECONDS: 900,
       REFRESH_TOKEN_TTL_DAYS: 30,
     });
+  });
+
+  it("rejects a PAYBRIDGE_API_URL that is not a URL", () => {
+    expect(() =>
+      loadConfig({ ...validEnv, PAYBRIDGE_API_URL: "paybridge" }),
+    ).toThrow(/PAYBRIDGE_API_URL/);
   });
 });
