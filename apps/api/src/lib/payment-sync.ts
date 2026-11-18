@@ -35,6 +35,7 @@ const loadPaymentState = async (db: Database, orderId: string) => {
       phone: orders.customerPhone,
       total: orders.total,
       paymentId: orders.paybridgePaymentId,
+      flagged: orders.flaggedReason,
     })
     .from(orders)
     .where(eq(orders.id, orderId));
@@ -166,7 +167,9 @@ export const requestPayment = async (deps: PaymentDeps, orderId: string) => {
 export const syncPayment = async (deps: PaymentDeps, orderId: string) => {
   try {
     const order = await loadPaymentState(deps.db, orderId);
-    if (!order || order.status !== "PENDING_PAYMENT") return;
+    // A flagged order waits for a person; polling PayBridge again would only
+    // spend the shared rate limit and log the same error.
+    if (!order || order.status !== "PENDING_PAYMENT" || order.flagged) return;
 
     const acquired = await deps.redis.set(
       `paybridge:sync:${orderId}`,

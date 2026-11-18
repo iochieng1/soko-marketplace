@@ -1,5 +1,5 @@
 import { orderSchema, sellerProductSchema } from "@soko/shared";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { buildApp } from "../src/app.js";
@@ -11,6 +11,8 @@ import {
   stockReservations,
 } from "../src/db/schema.js";
 import type { PayBridgeStatus } from "../src/lib/paybridge.js";
+import { paymentReference } from "../src/lib/payment-sync.js";
+import { sweepExpiredReservations } from "../src/lib/reservations.js";
 import { signWebhook } from "../src/lib/webhook-signature.js";
 import { type FakePayBridge, startFakePayBridge } from "./fake-paybridge.js";
 import {
@@ -60,8 +62,8 @@ describe("POST /v1/webhooks/paybridge", () => {
     return sellerProductSchema.parse(res.json()).id;
   };
 
-  /** Places an order and returns it with its PayBridge payment id. */
-  const placeOrder = async (productId: string, quantity = 2) => {
+  /** Places an order and returns it with whatever payment id it got. */
+  const placeOrderRaw = async (productId: string, quantity = 2) => {
     const res = await app.inject({
       method: "POST",
       url: "/v1/checkout",
@@ -78,8 +80,14 @@ describe("POST /v1/webhooks/paybridge", () => {
       .select({ paymentId: orders.paybridgePaymentId })
       .from(orders)
       .where(eq(orders.id, order.id));
-    expect(r?.paymentId).toBeTruthy();
-    return { order, paymentId: r!.paymentId! };
+    return { order, paymentId: r?.paymentId ?? null };
+  };
+
+  /** Places an order and returns it with its PayBridge payment id. */
+  const placeOrder = async (productId: string, quantity = 2) => {
+    const { order, paymentId } = await placeOrderRaw(productId, quantity);
+    expect(paymentId).toBeTruthy();
+    return { order, paymentId: paymentId! };
   };
 
   /** The body PayBridge sends for a payment's final status. */
@@ -348,10 +356,156 @@ describe("POST /v1/webhooks/paybridge", () => {
     expect(await processed("evt_unknown")).toHaveLength(0);
   });
 
-  it("answers 400 for a signed body it can't read", async () => {
-    const res = await deliver('{"id":"evt_x","data":{"status":"PAID"}}');
-    expect(res.statusCode).toBe(400);
-    expect(res.json().error.code).toBe("INVALID_EVENT");
+  it.each([
+    ["an unreadable body", "not json"],
+    ["a body without data", '{"id":"evt_x","type":"payment.succeeded"}'],
+    [
+      "a status it doesn't know yet",
+      '{"id":"evt_y","type":"payment.reversed","data":{"id":"p","status":"REVERSED","amount":1}}',
+    ],
+  ])(
+    "acknowledges %s with 200 so PayBridge stops retrying",
+    async (_l, body) => {
+      const res = await deliver(body);
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ received: true });
+      expect(res.json().ignored).toBeTruthy();
+    },
+  );
+
+  it("doesn't apply a final status sent under another event type", async () => {
+    const product = await createProduct(10);
+    const { order, paymentId } = await placeOrder(product, 1);
+    const body = JSON.parse(eventFor(paymentId, "SUCCEEDED")) as {
+      type: string;
+    };
+    body.type = "payment.refund_requested";
+
+    const res = await deliver(JSON.stringify(body));
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ignored).toBe("unexpected event type");
+    expect((await orderRow(order.id)).status).toBe("PENDING_PAYMENT");
+    expect(await processed(`evt_${paymentId}`)).toHaveLength(0);
+  });
+
+  describe("an order whose payment id was never stored", () => {
+    /** Checkout's PayBridge call failed, so the order has no payment id. */
+    const placeOrderWithoutPaymentId = async (quantity = 2) => {
+      const product = await createProduct(10);
+      paybridge.onCreate(() => ({ status: 503, body: { message: "busy" } }));
+      try {
+        const { order } = await placeOrderRaw(product, quantity);
+        expect((await orderRow(order.id)).paybridgePaymentId).toBeNull();
+        return { order, product };
+      } finally {
+        paybridge.onCreate(undefined);
+      }
+    };
+
+    const successFor = (
+      order: { id: string; total: number },
+      changes: Record<string, unknown> = {},
+    ) =>
+      JSON.stringify({
+        id: "evt_pay_late",
+        type: "payment.succeeded",
+        data: {
+          id: `pay_${crypto.randomUUID()}`,
+          status: "SUCCEEDED",
+          amount: order.total,
+          phone: "254712345678",
+          reference: paymentReference(order.id),
+          ...changes,
+        },
+      });
+
+    it("is found by reference, amount and phone, and its payment id stored", async () => {
+      const { order, product } = await placeOrderWithoutPaymentId(2);
+      const body = successFor(order);
+      const paymentId = (JSON.parse(body) as { data: { id: string } }).data.id;
+
+      const res = await deliver(
+        body.replace("evt_pay_late", `evt_${paymentId}`),
+      );
+
+      expect(res.statusCode).toBe(200);
+      const row = await orderRow(order.id);
+      expect(row.status).toBe("PAID");
+      expect(row.paybridgePaymentId).toBe(paymentId);
+      expect(await stock(product)).toEqual({ onHand: 8, reserved: 0 });
+    });
+
+    it("still gets a late payment after the order expired", async () => {
+      const { order, product } = await placeOrderWithoutPaymentId(2);
+      await app.db
+        .update(stockReservations)
+        .set({ expiresAt: sql`now() - interval '1 minute'` })
+        .where(eq(stockReservations.orderId, order.id));
+      await sweepExpiredReservations(app.db);
+      expect((await orderRow(order.id)).status).toBe("EXPIRED");
+
+      const body = successFor(order);
+      const paymentId = (JSON.parse(body) as { data: { id: string } }).data.id;
+      const res = await deliver(
+        body.replace("evt_pay_late", `evt_${paymentId}`),
+      );
+
+      expect(res.statusCode).toBe(200);
+      expect((await orderRow(order.id)).status).toBe("PAID");
+      expect(await stock(product)).toEqual({ onHand: 8, reserved: 0 });
+    });
+
+    it.each([
+      ["amount", { amount: 1 }],
+      ["phone", { phone: "254700000000" }],
+      ["reference", { reference: "SOKO00000000" }],
+    ])("isn't matched when the %s differs", async (_label, changes) => {
+      const { order } = await placeOrderWithoutPaymentId(1);
+      const body = successFor(order, changes);
+
+      expect((await deliver(body)).statusCode).toBe(404);
+      expect((await orderRow(order.id)).status).toBe("PENDING_PAYMENT");
+      expect((await orderRow(order.id)).paybridgePaymentId).toBeNull();
+    });
+  });
+
+  describe("a flagged order", () => {
+    const flag = async () => {
+      const product = await createProduct(10, 1500);
+      const { order, paymentId } = await placeOrder(product, 1);
+      await deliver(eventFor(paymentId, "SUCCEEDED", { amount: 15 }));
+      expect((await orderRow(order.id)).flaggedReason).toBeTruthy();
+      return { order, product, paymentId };
+    };
+
+    it("keeps its stock: the expiry sweeper skips it", async () => {
+      const { order, product } = await flag();
+      await app.db
+        .update(stockReservations)
+        .set({ expiresAt: sql`now() - interval '1 minute'` })
+        .where(eq(stockReservations.orderId, order.id));
+
+      await sweepExpiredReservations(app.db);
+
+      expect((await orderRow(order.id)).status).toBe("PENDING_PAYMENT");
+      expect(await holds(order.id)).toEqual(["ACTIVE"]);
+      expect(await stock(product)).toEqual({ onHand: 10, reserved: 1 });
+    });
+
+    it("isn't looked up in PayBridge again by status polls", async () => {
+      const { order } = await flag();
+      paybridge.reset();
+      await app.redis.del(`paybridge:sync:${order.id}`);
+
+      const res = await app.inject({
+        method: "GET",
+        url: `/v1/orders/${order.id}/status`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(paybridge.lookups()).toHaveLength(0);
+    });
   });
 
   it("acknowledges a non-final status without recording it", async () => {

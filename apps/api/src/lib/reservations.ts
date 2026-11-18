@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 
 import type { Database } from "../db/client.js";
 import { inventory, orders, stockReservations } from "../db/schema.js";
@@ -56,13 +56,17 @@ export const applyStockChanges = async (
 const sweepBatch = async (db: Database, batchSize: number) =>
   db.transaction(async (tx) => {
     // Served by the partial index on expires_at WHERE status = 'ACTIVE'.
+    // Flagged orders are skipped: a person decides what happens to their
+    // stock, so it stays held until then.
     const expired = await tx
       .select({ orderId: stockReservations.orderId })
       .from(stockReservations)
+      .innerJoin(orders, eq(orders.id, stockReservations.orderId))
       .where(
         and(
           eq(stockReservations.status, "ACTIVE"),
           lte(stockReservations.expiresAt, sql`now()`),
+          isNull(orders.flaggedReason),
         ),
       )
       .orderBy(asc(stockReservations.expiresAt))
@@ -76,7 +80,7 @@ const sweepBatch = async (db: Database, batchSize: number) =>
     const locked = await tx
       .select({ id: orders.id })
       .from(orders)
-      .where(inArray(orders.id, candidates))
+      .where(and(inArray(orders.id, candidates), isNull(orders.flaggedReason)))
       .orderBy(asc(orders.id))
       .for("update", { skipLocked: true });
     const orderIds = locked.map((o) => o.id);
