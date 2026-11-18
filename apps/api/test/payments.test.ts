@@ -325,6 +325,7 @@ describe("M-Pesa payment via PayBridge", () => {
 
       expect((await pollStatus(order.id)).status).toBe("PENDING_PAYMENT");
       expect(await stock(product)).toEqual({ onHand: 10, reserved: 1 });
+      expect((await row(order.id)).flaggedReason).toMatch(/KES 1, but/);
     });
 
     it("looks the payment up at most once per sync interval", async () => {

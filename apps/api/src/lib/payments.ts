@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "../db/client.js";
 import {
@@ -7,7 +7,9 @@ import {
   orders,
   stockReservations,
 } from "../db/schema.js";
-import { applyStockChanges } from "./reservations.js";
+import { enqueueOrderConfirmation } from "./outbox.js";
+import type { PayBridgePayment } from "./paybridge.js";
+import { applyStockChanges, type Tx } from "./reservations.js";
 
 export type PaymentOutcome =
   /** The order was waiting for payment and its stock was still held. */
@@ -45,115 +47,126 @@ class StockGone extends Error {}
  *     is flagged REFUND_PENDING.
  *   - Anything else is already settled, so a duplicate is a no-op.
  *
+ * A paid order also gets its confirmation email and SMS queued in the outbox,
+ * in the same transaction.
+ *
  * Returns undefined if the order doesn't exist.
  */
-export const confirmPayment = async (
+export const confirmPayment = (
   db: Database,
   orderId: string,
 ): Promise<PaymentOutcome | undefined> =>
-  db.transaction(async (tx) => {
-    const [order] = await tx
-      .select({ status: orders.status })
-      .from(orders)
-      .where(eq(orders.id, orderId))
-      .for("update");
-    if (!order) return undefined;
+  db.transaction((tx) => confirmPaymentIn(tx, orderId));
 
-    const settle = async (status: "PAID" | "REFUND_PENDING") => {
-      await tx
-        .update(orders)
-        .set({ status, updatedAt: sql`now()` })
-        .where(eq(orders.id, orderId));
-    };
+/** `confirmPayment` inside a transaction the caller owns. */
+export const confirmPaymentIn = async (
+  tx: Tx,
+  orderId: string,
+): Promise<PaymentOutcome | undefined> => {
+  const [order] = await tx
+    .select({ status: orders.status })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .for("update");
+  if (!order) return undefined;
 
-    switch (order.status) {
-      case "PENDING_PAYMENT": {
-        const consumed = await tx
-          .update(stockReservations)
-          .set({ status: "CONSUMED" })
-          .where(
-            and(
-              eq(stockReservations.orderId, orderId),
-              eq(stockReservations.status, "ACTIVE"),
-            ),
-          )
-          .returning({
-            productId: stockReservations.productId,
-            quantity: stockReservations.quantity,
-          });
-        await applyStockChanges(tx, consumed, (q) => ({
-          onHand: sql`${inventory.onHand} - ${q}`,
-          reserved: sql`${inventory.reserved} - ${q}`,
-        }));
-        await settle("PAID");
-        return "PAID";
-      }
+  const settle = async (status: "PAID" | "REFUND_PENDING") => {
+    await tx
+      .update(orders)
+      .set({ status, updatedAt: sql`now()` })
+      .where(eq(orders.id, orderId));
+  };
 
-      // PayBridge only moves forward, so success after a failure shouldn't
-      // happen; if it does, the customer paid, and is treated like a late
-      // payment.
-      case "EXPIRED":
-      case "PAYMENT_FAILED": {
-        const items = await tx
-          .select({
-            productId: orderItems.productId,
-            quantity: orderItems.quantity,
-          })
-          .from(orderItems)
-          .where(eq(orderItems.orderId, orderId))
-          .orderBy(asc(orderItems.productId));
+  switch (order.status) {
+    case "PENDING_PAYMENT": {
+      const consumed = await tx
+        .update(stockReservations)
+        .set({ status: "CONSUMED" })
+        .where(
+          and(
+            eq(stockReservations.orderId, orderId),
+            eq(stockReservations.status, "ACTIVE"),
+          ),
+        )
+        .returning({
+          productId: stockReservations.productId,
+          quantity: stockReservations.quantity,
+        });
+      await applyStockChanges(tx, consumed, (q) => ({
+        onHand: sql`${inventory.onHand} - ${q}`,
+        reserved: sql`${inventory.reserved} - ${q}`,
+      }));
+      await settle("PAID");
+      await enqueueOrderConfirmation(tx, orderId);
+      return "PAID";
+    }
 
-        try {
-          // Savepoint: if a later line is short, the earlier ones roll back.
-          await tx.transaction(async (sp) => {
-            // Same conditional UPDATE as checkout, in the same product id
-            // order, but taking the stock straight out of on_hand: the order
-            // is paid, so there's nothing left to hold it for.
-            for (const item of items) {
-              const taken = await sp
-                .update(inventory)
-                .set({
-                  onHand: sql`${inventory.onHand} - ${item.quantity}`,
-                  version: sql`${inventory.version} + 1`,
-                  updatedAt: sql`now()`,
-                })
-                .where(
-                  and(
-                    eq(inventory.productId, item.productId),
-                    sql`${inventory.onHand} - ${inventory.reserved} >= ${item.quantity}`,
-                  ),
-                )
-                .returning({ productId: inventory.productId });
-              if (taken.length === 0) throw new StockGone();
-            }
-            // Recorded as consumed holds, so stock movements stay traceable.
-            await sp.insert(stockReservations).values(
-              items.map((i) => ({
-                orderId,
-                productId: i.productId,
-                quantity: i.quantity,
-                status: "CONSUMED" as const,
-                expiresAt: sql`now()`,
-              })),
-            );
-          });
-        } catch (err) {
-          if (!(err instanceof StockGone)) throw err;
-          await settle("REFUND_PENDING");
-          return "REFUND_PENDING";
-        }
-        await settle("PAID");
-        return "PAID_LATE";
-      }
+    // PayBridge only moves forward, so success after a failure shouldn't
+    // happen; if it does, the customer paid, and is treated like a late
+    // payment.
+    case "EXPIRED":
+    case "PAYMENT_FAILED": {
+      const items = await tx
+        .select({
+          productId: orderItems.productId,
+          quantity: orderItems.quantity,
+        })
+        .from(orderItems)
+        .where(eq(orderItems.orderId, orderId))
+        .orderBy(asc(orderItems.productId));
 
-      case "CANCELLED":
+      try {
+        // Savepoint: if a later line is short, the earlier ones roll back.
+        await tx.transaction(async (sp) => {
+          // Same conditional UPDATE as checkout, in the same product id
+          // order, but taking the stock straight out of on_hand: the order
+          // is paid, so there's nothing left to hold it for.
+          for (const item of items) {
+            const taken = await sp
+              .update(inventory)
+              .set({
+                onHand: sql`${inventory.onHand} - ${item.quantity}`,
+                version: sql`${inventory.version} + 1`,
+                updatedAt: sql`now()`,
+              })
+              .where(
+                and(
+                  eq(inventory.productId, item.productId),
+                  sql`${inventory.onHand} - ${inventory.reserved} >= ${item.quantity}`,
+                ),
+              )
+              .returning({ productId: inventory.productId });
+            if (taken.length === 0) throw new StockGone();
+          }
+          // Recorded as consumed holds, so stock movements stay traceable.
+          await sp.insert(stockReservations).values(
+            items.map((i) => ({
+              orderId,
+              productId: i.productId,
+              quantity: i.quantity,
+              status: "CONSUMED" as const,
+              expiresAt: sql`now()`,
+            })),
+          );
+        });
+      } catch (err) {
+        if (!(err instanceof StockGone)) throw err;
         await settle("REFUND_PENDING");
         return "REFUND_PENDING";
-
-      default:
-        return "ALREADY_SETTLED";
+      }
+      await settle("PAID");
+      await enqueueOrderConfirmation(tx, orderId);
+      return "PAID_LATE";
     }
-  });
+
+    case "CANCELLED":
+      await settle("REFUND_PENDING");
+      return "REFUND_PENDING";
+
+    default:
+      return "ALREADY_SETTLED";
+  }
+};
 
 /**
  * Applies a failed, cancelled or timed-out payment: the order's held stock
@@ -167,38 +180,117 @@ export const confirmPayment = async (
  *
  * Returns undefined if the order doesn't exist.
  */
-export const failPayment = async (
+export const failPayment = (
   db: Database,
   orderId: string,
 ): Promise<FailureOutcome | undefined> =>
-  db.transaction(async (tx) => {
-    const [order] = await tx
-      .select({ status: orders.status })
-      .from(orders)
-      .where(eq(orders.id, orderId))
-      .for("update");
-    if (!order) return undefined;
-    if (order.status !== "PENDING_PAYMENT") return "ALREADY_SETTLED";
+  db.transaction((tx) => failPaymentIn(tx, orderId));
 
-    const released = await tx
-      .update(stockReservations)
-      .set({ status: "RELEASED" })
-      .where(
-        and(
-          eq(stockReservations.orderId, orderId),
-          eq(stockReservations.status, "ACTIVE"),
-        ),
-      )
-      .returning({
-        productId: stockReservations.productId,
-        quantity: stockReservations.quantity,
-      });
-    await applyStockChanges(tx, released, (q) => ({
-      reserved: sql`${inventory.reserved} - ${q}`,
-    }));
-    await tx
-      .update(orders)
-      .set({ status: "PAYMENT_FAILED", updatedAt: sql`now()` })
-      .where(eq(orders.id, orderId));
-    return "FAILED";
-  });
+/** `failPayment` inside a transaction the caller owns. */
+export const failPaymentIn = async (
+  tx: Tx,
+  orderId: string,
+): Promise<FailureOutcome | undefined> => {
+  const [order] = await tx
+    .select({ status: orders.status })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .for("update");
+  if (!order) return undefined;
+  if (order.status !== "PENDING_PAYMENT") return "ALREADY_SETTLED";
+
+  const released = await tx
+    .update(stockReservations)
+    .set({ status: "RELEASED" })
+    .where(
+      and(
+        eq(stockReservations.orderId, orderId),
+        eq(stockReservations.status, "ACTIVE"),
+      ),
+    )
+    .returning({
+      productId: stockReservations.productId,
+      quantity: stockReservations.quantity,
+    });
+  await applyStockChanges(tx, released, (q) => ({
+    reserved: sql`${inventory.reserved} - ${q}`,
+  }));
+  await tx
+    .update(orders)
+    .set({ status: "PAYMENT_FAILED", updatedAt: sql`now()` })
+    .where(eq(orders.id, orderId));
+  return "FAILED";
+};
+
+/**
+ * Marks an order for a person to look at, keeping the first reason if it's
+ * flagged twice. Nothing else about the order changes.
+ */
+export const flagOrder = async (tx: Tx, orderId: string, reason: string) => {
+  await tx
+    .update(orders)
+    .set({
+      flaggedReason: reason,
+      flaggedAt: sql`now()`,
+      updatedAt: sql`now()`,
+    })
+    .where(and(eq(orders.id, orderId), isNull(orders.flaggedReason)));
+};
+
+export type AppliedPayment =
+  | { kind: "paid"; outcome: PaymentOutcome }
+  | { kind: "failed"; outcome: FailureOutcome }
+  /** Succeeded for a different amount than the order total: flagged, not paid. */
+  | { kind: "amount_mismatch"; amount: number; orderTotal: number }
+  /** Still CREATED or PENDING: nothing to apply yet. */
+  | { kind: "pending" }
+  | { kind: "no_order" };
+
+/**
+ * Applies a PayBridge payment's status to its order, inside the caller's
+ * transaction. Both the webhook and the status-poll fallback go through here,
+ * and every branch is idempotent, so a poll and a webhook can both apply the
+ * same result.
+ *
+ * Soko set the amount when it created the payment, so a successful payment
+ * for any other amount means something is badly wrong: the order is flagged
+ * and left as it was (still holding its stock) instead of being marked paid.
+ */
+export const applyPaymentIn = async (
+  tx: Tx,
+  orderId: string,
+  payment: PayBridgePayment,
+): Promise<AppliedPayment> => {
+  switch (payment.status) {
+    case "SUCCEEDED": {
+      const [order] = await tx
+        .select({ total: orders.total })
+        .from(orders)
+        .where(eq(orders.id, orderId))
+        .for("update");
+      if (!order) return { kind: "no_order" };
+      if (payment.amount !== order.total) {
+        await flagOrder(
+          tx,
+          orderId,
+          `PayBridge payment ${payment.id} succeeded for KES ${payment.amount}, but the order total is KES ${order.total}`,
+        );
+        return {
+          kind: "amount_mismatch",
+          amount: payment.amount,
+          orderTotal: order.total,
+        };
+      }
+      const outcome = await confirmPaymentIn(tx, orderId);
+      return outcome ? { kind: "paid", outcome } : { kind: "no_order" };
+    }
+    case "FAILED":
+    case "CANCELLED":
+    case "TIMED_OUT": {
+      const outcome = await failPaymentIn(tx, orderId);
+      return outcome ? { kind: "failed", outcome } : { kind: "no_order" };
+    }
+    default:
+      return { kind: "pending" };
+  }
+};

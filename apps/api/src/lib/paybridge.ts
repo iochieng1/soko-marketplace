@@ -16,11 +16,28 @@ export const PAYBRIDGE_STATUSES = [
 ] as const;
 export type PayBridgeStatus = (typeof PAYBRIDGE_STATUSES)[number];
 
+/** A payment in one of these never changes again. */
+export const FINAL_PAYBRIDGE_STATUSES = [
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+] as const satisfies readonly PayBridgeStatus[];
+
+export const isFinalPayBridgeStatus = (
+  status: string,
+): status is (typeof FINAL_PAYBRIDGE_STATUSES)[number] =>
+  (FINAL_PAYBRIDGE_STATUSES as readonly string[]).includes(status);
+
 export const payBridgePaymentSchema = z.looseObject({
   id: z.string().min(1),
   status: z.enum(PAYBRIDGE_STATUSES),
   amount: z.number().int(),
   result_desc: z.string().nullable().optional(),
+  // What Soko sent when creating the payment; used to find an order whose
+  // payment id was never stored.
+  reference: z.string().optional(),
+  phone: z.string().optional(),
 });
 export type PayBridgePayment = z.infer<typeof payBridgePaymentSchema>;
 
