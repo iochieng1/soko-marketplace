@@ -109,3 +109,6 @@ export const acceptPrice = (productId: string, price: number) => {
 };
 
 export const removeFromCart = (productId: string) => setQuantity(productId, 0);
+
+/** Empties the cart, once its order is paid. */
+export const clearCart = () => write([]);

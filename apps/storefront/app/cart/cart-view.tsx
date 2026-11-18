@@ -20,6 +20,7 @@ import {
 } from "@/lib/cart";
 
 import { quoteCartAction } from "./actions";
+import { CheckoutForm } from "./checkout-form";
 
 const issueText = (line: CartQuoteLine): string | null => {
   if (line.issues.includes("UNAVAILABLE")) return "No longer for sale";
@@ -163,17 +164,7 @@ export function CartView() {
             Split this into smaller orders.
           </p>
         )}
-        {/* Checkout reserves stock and starts an M-Pesa prompt; the payment
-            step lands with the PayBridge integration. */}
-        <button
-          disabled
-          title="M-Pesa checkout is coming soon"
-          className="rounded-md bg-emerald-700 px-6 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {quote && !quote.can_checkout
-            ? "Fix the items above to check out"
-            : "Pay with M-Pesa (coming soon)"}
-        </button>
+        <CheckoutForm lines={lines} quote={quote} />
       </div>
     </div>
   );

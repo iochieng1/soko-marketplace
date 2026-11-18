@@ -104,6 +104,8 @@ export const orderStatusSchema = z.enum([
   "EXPIRED",
   "FULFILLED",
   "REFUND_PENDING",
+  // The M-Pesa payment failed, was cancelled or timed out. Stock is released.
+  "PAYMENT_FAILED",
 ]);
 export type OrderStatus = z.infer<typeof orderStatusSchema>;
 
@@ -130,3 +132,20 @@ export const orderSchema = z.object({
   created_at: z.iso.datetime({ offset: true }),
 });
 export type Order = z.infer<typeof orderSchema>;
+
+/**
+ * `GET /v1/orders/:id/status`: what the "check your phone" screen polls.
+ * Public (the order id is the secret), so it carries no customer details.
+ */
+export const orderStatusResponseSchema = orderSchema.pick({
+  id: true,
+  status: true,
+  total: true,
+  currency: true,
+  reserved_until: true,
+});
+export type OrderStatusResponse = z.infer<typeof orderStatusResponseSchema>;
+
+/** Statuses after which an order's payment won't change by itself. */
+export const isOrderSettled = (status: OrderStatus) =>
+  status !== "PENDING_PAYMENT";

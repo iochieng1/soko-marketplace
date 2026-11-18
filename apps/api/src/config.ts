@@ -25,6 +25,19 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(60),
+  // PayBridge (M-Pesa STK push). Base URL without the /v1 path.
+  PAYBRIDGE_API_URL: z.url(),
+  PAYBRIDGE_API_KEY: z.string().min(1),
+  // Verifies X-PayBridge-Signature on incoming webhooks.
+  PAYBRIDGE_WEBHOOK_SECRET: z.string().min(1),
+  // Least time between two PayBridge lookups for the same order when the
+  // storefront polls its status. PayBridge allows 60 payment calls a minute
+  // per API key, shared by every shopper, so polls can't each make one.
+  PAYBRIDGE_SYNC_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(10),
 });
 
 export type Config = z.infer<typeof envSchema>;

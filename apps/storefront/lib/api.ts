@@ -2,6 +2,8 @@ import {
   authResponseSchema,
   cartQuoteSchema,
   errorResponseSchema,
+  orderSchema,
+  orderStatusResponseSchema,
   productDetailSchema,
   productListResponseSchema,
   sellerProductListResponseSchema,
@@ -11,8 +13,11 @@ import {
   type AuthResponse,
   type CartQuote,
   type CartQuoteRequest,
+  type CheckoutRequest,
   type CreateProductRequest,
   type LoginRequest,
+  type Order,
+  type OrderStatusResponse,
   type ProductDetail,
   type ProductListResponse,
   type RegisterRequest,
@@ -50,20 +55,29 @@ type RequestOptions = {
   body?: unknown;
   token?: string;
   query?: Record<string, string | undefined>;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
 };
 
 /** Calls the Soko API and validates the response against the shared contract. */
 const request = async <S extends z.ZodType>(
   path: string,
   schema: S | null,
-  { method = "GET", body, token, query }: RequestOptions = {},
+  {
+    method = "GET",
+    body,
+    token,
+    query,
+    headers: extraHeaders,
+    timeoutMs = 5_000,
+  }: RequestOptions = {},
 ): Promise<z.infer<S>> => {
   const url = new URL(`${apiBaseUrl()}${path}`);
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value) url.searchParams.set(key, value);
   }
 
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...extraHeaders };
   if (body !== undefined) headers["content-type"] = "application/json";
   if (token) headers.authorization = `Bearer ${token}`;
 
@@ -74,7 +88,7 @@ const request = async <S extends z.ZodType>(
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
-      signal: AbortSignal.timeout(5_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     throw new ApiError("Could not reach the Soko API", undefined, undefined, {
@@ -132,6 +146,39 @@ export const fetchProduct = async (
 /** Current prices and stock for a cart. The client's prices aren't trusted. */
 export const quoteCart = (body: CartQuoteRequest): Promise<CartQuote> =>
   request("/v1/cart/quote", cartQuoteSchema, { method: "POST", body });
+
+// Checkout and payment
+
+/**
+ * Places the order and starts the M-Pesa prompt. Send the same
+ * `idempotencyKey` when retrying, so a retry can't place a second order.
+ */
+export const placeOrder = (
+  body: CheckoutRequest,
+  idempotencyKey: string,
+): Promise<Order> =>
+  request("/v1/checkout", orderSchema, {
+    method: "POST",
+    body,
+    headers: { "idempotency-key": idempotencyKey },
+    // Checkout waits for PayBridge to send the STK push.
+    timeoutMs: 25_000,
+  });
+
+/** null when there is no such order. */
+export const fetchOrderStatus = async (
+  orderId: string,
+): Promise<OrderStatusResponse | null> => {
+  try {
+    return await request(
+      `/v1/orders/${encodeURIComponent(orderId)}/status`,
+      orderStatusResponseSchema,
+    );
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+};
 
 // Seller auth
 
