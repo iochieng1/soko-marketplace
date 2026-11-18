@@ -282,11 +282,21 @@ export const outbox = pgTable(
     createdAt: createdAt(),
     processedAt: timestamp("processed_at", { withTimezone: true }),
     attempts: integer("attempts").notNull().default(0),
+    // Earliest time the worker may try again (backoff after a failure).
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    lastError: text("last_error"),
+    // Set when the worker gives up (too many attempts, or a message the
+    // provider will never accept). The row stays for a person to look at;
+    // requeueAbandoned() puts it back with a fresh set of attempts.
+    failedAt: timestamp("failed_at", { withTimezone: true }),
   },
   (t) => [
-    // The worker polls unprocessed rows in id order (FOR UPDATE SKIP LOCKED).
-    index("outbox_unprocessed_idx")
-      .on(t.id)
-      .where(sql`${t.processedAt} is null`),
+    // The worker polls pending rows that are due, oldest first
+    // (FOR UPDATE SKIP LOCKED). Sent and abandoned rows drop out of the index.
+    index("outbox_pending_idx")
+      .on(t.nextAttemptAt, t.id)
+      .where(sql`${t.processedAt} is null and ${t.failedAt} is null`),
   ],
 );

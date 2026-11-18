@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+// An empty value (`RESEND_API_KEY=` in .env) counts as not set.
+const emptyAsUnset = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === "" ? undefined : value), schema);
+const optional = emptyAsUnset(z.string().min(1).optional());
+
 const envSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -38,6 +43,22 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(10),
+  // Confirmation email via Resend. Without a key, emails are logged in
+  // development and left queued (and retried) in production.
+  RESEND_API_KEY: optional,
+  EMAIL_FROM: emptyAsUnset(
+    z.string().min(3).default("Soko <onboarding@resend.dev>"),
+  ),
+  // Confirmation SMS via Africa's Talking. Username "sandbox" uses the
+  // sandbox API (messages go to the simulator, not real phones).
+  AFRICASTALKING_USERNAME: optional,
+  AFRICASTALKING_API_KEY: optional,
+  AFRICASTALKING_SENDER_ID: optional,
+  // How often each instance looks for outbox messages to send.
+  OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(2000),
+  // Failed sends before a message is abandoned (and an error is logged).
+  // With the default backoff, 8 attempts span about an hour.
+  OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().default(8),
 });
 
 export type Config = z.infer<typeof envSchema>;

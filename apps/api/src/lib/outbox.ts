@@ -1,6 +1,24 @@
-import { asc, eq } from "drizzle-orm";
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lte,
+  sql,
+} from "drizzle-orm";
+import type { FastifyBaseLogger } from "fastify";
+import { z } from "zod";
 
+import type { Database } from "../db/client.js";
 import { orderItems, orders, outbox, products } from "../db/schema.js";
+import {
+  NotConfiguredError,
+  type Notifier,
+  PermanentNotifierError,
+} from "./notifier.js";
+import { paymentReference } from "./payment-sync.js";
 import type { Tx } from "./reservations.js";
 
 export const ORDER_CONFIRMATION_EMAIL = "order_confirmation.email";
@@ -65,4 +83,246 @@ export const enqueueOrderConfirmation = async (tx: Tx, orderId: string) => {
       payload: { ...base, to: order.phone } satisfies OrderConfirmationPayload,
     },
   ]);
+};
+
+const confirmationPayloadSchema = z.object({
+  order_id: z.string(),
+  to: z.string().min(1),
+  total: z.number().int(),
+  items: z.array(
+    z.object({
+      title: z.string(),
+      quantity: z.number().int(),
+      line_total: z.number().int(),
+    }),
+  ),
+});
+
+const kes = (amount: number) => `KES ${amount.toLocaleString("en-KE")}`;
+
+/**
+ * How to send each outbox message type. Each type checks its own payload, so
+ * a new message type brings its own schema rather than squeezing into this
+ * one.
+ */
+const handlers: Record<
+  string,
+  (notifier: Notifier, payload: unknown) => Promise<void> | undefined
+> = {
+  [ORDER_CONFIRMATION_EMAIL]: (notifier, payload) => {
+    const p = confirmationPayloadSchema.safeParse(payload);
+    if (!p.success) return undefined;
+    const reference = paymentReference(p.data.order_id);
+    return notifier.email({
+      to: p.data.to,
+      subject: `Order ${reference} is confirmed`,
+      text: [
+        "Thank you for shopping on Soko. We've received your M-Pesa payment.",
+        "",
+        ...p.data.items.map(
+          (i) => `${i.quantity} x ${i.title}  ${kes(i.line_total)}`,
+        ),
+        "",
+        `Total paid: ${kes(p.data.total)}`,
+        `Order reference: ${reference}`,
+      ].join("\n"),
+      // The order id is a UUID, so the key is unique across databases and
+      // environments sharing a Resend key, and the same on a resend after a
+      // crash (when Resend drops the repeat).
+      idempotencyKey: `order-confirmation-email-${p.data.order_id}`,
+    });
+  },
+  [ORDER_CONFIRMATION_SMS]: (notifier, payload) => {
+    const p = confirmationPayloadSchema.safeParse(payload);
+    if (!p.success) return undefined;
+    return notifier.sms({
+      to: p.data.to,
+      message: `Soko: payment of ${kes(p.data.total)} received for order ${paymentReference(p.data.order_id)}. Thank you!`,
+    });
+  },
+};
+
+/** Thrown for a row no number of retries will send. */
+class Undeliverable extends Error {}
+
+/** Sends one outbox row's message. Throws if it wasn't accepted. */
+const send = async (
+  notifier: Notifier,
+  row: { type: string; payload: unknown },
+) => {
+  const handler = handlers[row.type];
+  if (!handler) {
+    throw new Undeliverable(`Unknown outbox message type ${row.type}`);
+  }
+  const sending = handler(notifier, row.payload);
+  if (!sending) throw new Undeliverable(`Unreadable payload for ${row.type}`);
+  await sending;
+};
+
+export interface OutboxWorkerDeps {
+  db: Database;
+  notifier: Notifier;
+  log: FastifyBaseLogger;
+  /** Give up on a row after this many failed attempts. */
+  maxAttempts: number;
+  /** Wait before retry number `attempt` (1 = after the first failure). */
+  backoffMs?: (attempt: number) => number;
+}
+
+/** 30 s, 1 min, 2 min, 4 min … capped at an hour. */
+export const defaultBackoffMs = (attempt: number) =>
+  Math.min(30_000 * 2 ** (attempt - 1), 60 * 60_000);
+
+/** How long a message for an unconfigured channel waits before a recheck. */
+export const NOT_CONFIGURED_RECHECK_MS = 5 * 60_000;
+
+export type ProcessResult = "idle" | "sent" | "retry" | "deferred" | "gave_up";
+
+/**
+ * Claims the oldest due message, sends it and records the outcome, all in one
+ * transaction.
+ *
+ * - `FOR UPDATE SKIP LOCKED` means a row being sent is invisible to every
+ *   other worker, so two workers never send the same message at once. They
+ *   just take the next row.
+ * - If the process dies mid-send, the transaction never commits: the lock
+ *   goes away, `processed_at` is still null, and the next worker sends it
+ *   again. Nothing is lost. The price is that a message can go out twice
+ *   when the provider accepted it but the commit didn't happen. The email
+ *   carries an idempotency key tied to the order, so Resend drops the
+ *   repeat. Africa's Talking has no such key, so a repeated SMS is possible
+ *   in that narrow window.
+ * - A failed send bumps `attempts` and pushes `next_attempt_at` back. After
+ *   `maxAttempts`, or at once for a message the provider says it will never
+ *   accept, the row gets `failed_at` and an error log to alert on.
+ * - A channel with no provider configured doesn't count as an attempt: the
+ *   row waits and is checked again in a few minutes.
+ */
+export const processOutboxOnce = ({
+  db,
+  notifier,
+  log,
+  maxAttempts,
+  backoffMs = defaultBackoffMs,
+}: OutboxWorkerDeps): Promise<ProcessResult> =>
+  db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({
+        id: outbox.id,
+        type: outbox.type,
+        payload: outbox.payload,
+        attempts: outbox.attempts,
+      })
+      .from(outbox)
+      .where(
+        and(
+          isNull(outbox.processedAt),
+          isNull(outbox.failedAt),
+          lte(outbox.nextAttemptAt, sql`now()`),
+        ),
+      )
+      .orderBy(asc(outbox.nextAttemptAt), asc(outbox.id))
+      .limit(1)
+      .for("update", { skipLocked: true });
+    if (!row) return "idle";
+
+    const later = (ms: number) =>
+      sql`now() + make_interval(secs => ${ms / 1000})`;
+    const attempts = row.attempts + 1;
+    const context = { outboxId: row.id, type: row.type, attempts };
+    try {
+      await send(notifier, row);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof NotConfiguredError) {
+        await tx
+          .update(outbox)
+          .set({
+            lastError: message,
+            nextAttemptAt: later(NOT_CONFIGURED_RECHECK_MS),
+          })
+          .where(eq(outbox.id, row.id));
+        log.warn(
+          { outboxId: row.id, type: row.type },
+          "Outbox message waiting for its provider to be configured",
+        );
+        return "deferred";
+      }
+      if (
+        err instanceof Undeliverable ||
+        err instanceof PermanentNotifierError ||
+        attempts >= maxAttempts
+      ) {
+        await tx
+          .update(outbox)
+          .set({ attempts, lastError: message, failedAt: sql`now()` })
+          .where(eq(outbox.id, row.id));
+        // ALERT: a customer won't hear about their order.
+        log.error(
+          { ...context, err },
+          "Outbox message abandoned; it needs a person to look at it",
+        );
+        return "gave_up";
+      }
+      const delay = backoffMs(attempts);
+      await tx
+        .update(outbox)
+        .set({ attempts, lastError: message, nextAttemptAt: later(delay) })
+        .where(eq(outbox.id, row.id));
+      log.warn({ ...context, err, retryInMs: delay }, "Outbox send failed");
+      return "retry";
+    }
+
+    await tx
+      .update(outbox)
+      .set({ attempts, processedAt: sql`now()`, lastError: null })
+      .where(eq(outbox.id, row.id));
+    log.info(context, "Outbox message sent");
+    return "sent";
+  });
+
+/**
+ * Processes due messages one by one until none is left, `limit` is hit or
+ * `shouldStop` says so (checked between messages, so shutdown waits for at
+ * most the one being sent). Returns how each went.
+ */
+export const drainOutbox = async (
+  deps: OutboxWorkerDeps,
+  {
+    limit = 100,
+    shouldStop = () => false,
+  }: { limit?: number; shouldStop?: () => boolean } = {},
+) => {
+  const counts: Record<Exclude<ProcessResult, "idle">, number> = {
+    sent: 0,
+    retry: 0,
+    deferred: 0,
+    gave_up: 0,
+  };
+  for (let i = 0; i < limit && !shouldStop(); i++) {
+    const result = await processOutboxOnce(deps);
+    if (result === "idle") break;
+    counts[result]++;
+  }
+  return counts;
+};
+
+/**
+ * Puts abandoned messages back in the queue with a fresh set of attempts.
+ * Pass ids to pick which; with none, every abandoned message is re-queued.
+ * Returns the ids re-queued.
+ */
+export const requeueAbandoned = async (db: Database, ids?: number[]) => {
+  const rows = await db
+    .update(outbox)
+    .set({ failedAt: null, attempts: 0, nextAttemptAt: sql`now()` })
+    .where(
+      and(
+        isNotNull(outbox.failedAt),
+        isNull(outbox.processedAt),
+        ids ? inArray(outbox.id, ids) : undefined,
+      ),
+    )
+    .returning({ id: outbox.id });
+  return rows.map((r) => r.id);
 };

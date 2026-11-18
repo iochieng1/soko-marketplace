@@ -25,6 +25,16 @@ services:
         sync: false
       - key: PAYBRIDGE_WEBHOOK_SECRET
         sync: false
+      # Confirmation email (Resend) and SMS (Africa's Talking). Until these
+      # are set, confirmations stay queued in the outbox and are retried.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: AFRICASTALKING_USERNAME
+        sync: false
+      - key: AFRICASTALKING_API_KEY
+        sync: false
       - key: REDIS_URL
         fromService:
           type: keyvalue

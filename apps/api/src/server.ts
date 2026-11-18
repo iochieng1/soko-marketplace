@@ -1,6 +1,8 @@
 import { buildApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { startOutboxWorker } from "./jobs/outbox-worker.js";
 import { startReservationSweeper } from "./jobs/reservation-sweeper.js";
+import { createNotifier } from "./lib/notifier.js";
 
 const config = loadConfig();
 const app = await buildApp(config);
@@ -14,10 +16,21 @@ const sweeper = await startReservationSweeper({
   everyMs: config.RESERVATION_SWEEP_INTERVAL_SECONDS * 1000,
 });
 
+// Sends the confirmation emails and SMS queued when orders are paid.
+const outboxWorker = startOutboxWorker(
+  {
+    db: app.db,
+    notifier: createNotifier(config, app.log),
+    log: app.log,
+    maxAttempts: config.OUTBOX_MAX_ATTEMPTS,
+  },
+  { everyMs: config.OUTBOX_POLL_INTERVAL_MS },
+);
+
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, "Shutting down");
-  // Stop taking sweep jobs before the database pool closes under them.
-  await sweeper.close();
+  // Stop taking jobs before the database pool closes under them.
+  await Promise.all([sweeper.close(), outboxWorker.close()]);
   await app.close();
   process.exit(0);
 };

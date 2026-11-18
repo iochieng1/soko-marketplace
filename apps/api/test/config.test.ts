@@ -61,4 +61,15 @@ describe("loadConfig", () => {
       loadConfig({ ...validEnv, PAYBRIDGE_API_URL: "paybridge" }),
     ).toThrow(/PAYBRIDGE_API_URL/);
   });
+
+  it("treats empty notifier credentials as unset", () => {
+    const config = loadConfig({
+      ...validEnv,
+      RESEND_API_KEY: "",
+      AFRICASTALKING_API_KEY: "",
+    });
+    expect(config.RESEND_API_KEY).toBeUndefined();
+    expect(config.AFRICASTALKING_API_KEY).toBeUndefined();
+    expect(config.OUTBOX_MAX_ATTEMPTS).toBe(8);
+  });
 });
