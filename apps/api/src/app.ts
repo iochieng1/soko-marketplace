@@ -16,6 +16,7 @@ import healthRoutes from "./routes/health.js";
 import orderRoutes from "./routes/orders.js";
 import productRoutes from "./routes/products.js";
 import sellerProductRoutes from "./routes/seller-products.js";
+import webhookRoutes from "./routes/webhooks.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -78,6 +79,7 @@ export const buildApp = async (config: Config) => {
   await app.register(cartRoutes, { prefix: "/v1" });
   await app.register(checkoutRoutes, { prefix: "/v1" });
   await app.register(orderRoutes, { prefix: "/v1" });
+  await app.register(webhookRoutes, { prefix: "/v1" });
 
   return app;
 };

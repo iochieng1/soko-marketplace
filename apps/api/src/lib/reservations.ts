@@ -3,7 +3,7 @@ import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import { inventory, orders, stockReservations } from "../db/schema.js";
 
-type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+export type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export interface SweepResult {
   /** Orders moved from PENDING_PAYMENT to EXPIRED. */

@@ -184,6 +184,10 @@ export const orders = pgTable(
     idempotencyKey: text("idempotency_key").notNull().unique(),
     // Set once PayBridge accepts the payment; webhooks look the order up by it.
     paybridgePaymentId: text("paybridge_payment_id").unique(),
+    // Set when something about the payment needs a person to look at it (a
+    // successful payment for the wrong amount). The order is left as it was.
+    flaggedReason: text("flagged_reason"),
+    flaggedAt: timestamp("flagged_at", { withTimezone: true }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

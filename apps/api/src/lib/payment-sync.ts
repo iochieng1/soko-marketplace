@@ -5,7 +5,11 @@ import type { Redis } from "ioredis";
 import type { Database } from "../db/client.js";
 import { orders } from "../db/schema.js";
 import type { PayBridgeClient, PayBridgePayment } from "./paybridge.js";
-import { confirmPayment, failPayment } from "./payments.js";
+import {
+  type AppliedPayment,
+  applyPaymentIn,
+  failPayment,
+} from "./payments.js";
 
 export interface PaymentDeps {
   db: Database;
@@ -44,56 +48,54 @@ const storePaymentId = (db: Database, orderId: string, paymentId: string) =>
     .where(and(eq(orders.id, orderId), isNull(orders.paybridgePaymentId)));
 
 /**
- * Applies a PayBridge payment's status to its order. Pending payments are
- * left alone; both outcomes are idempotent, so applying one twice (a poll and
- * a webhook, say) is harmless.
+ * Applies a PayBridge payment's status to its order and logs what happened.
+ * Pending payments are left alone; every outcome is idempotent, so applying
+ * one twice (a poll and a webhook, say) is harmless.
  */
 export const applyPaymentStatus = async (
-  deps: PaymentDeps,
+  deps: Pick<PaymentDeps, "db" | "log">,
   orderId: string,
-  orderTotal: number,
   payment: PayBridgePayment,
+): Promise<AppliedPayment> => {
+  const result = await deps.db.transaction((tx) =>
+    applyPaymentIn(tx, orderId, payment),
+  );
+  logApplied(deps.log, orderId, payment, result);
+  return result;
+};
+
+export const logApplied = (
+  log: FastifyBaseLogger,
+  orderId: string,
+  payment: PayBridgePayment,
+  result: AppliedPayment,
 ) => {
-  switch (payment.status) {
-    case "SUCCEEDED": {
-      // Soko set the amount, so a mismatch means something is badly wrong.
-      // Don't mark the order paid; leave it for a person to look at.
-      if (payment.amount !== orderTotal) {
-        deps.log.error(
-          {
-            orderId,
-            paymentId: payment.id,
-            amount: payment.amount,
-            orderTotal,
-          },
-          "PayBridge payment amount doesn't match the order total",
-        );
-        return;
-      }
-      const outcome = await confirmPayment(deps.db, orderId);
-      deps.log.info(
-        { orderId, paymentId: payment.id, outcome },
-        "Payment succeeded",
-      );
+  const context = { orderId, paymentId: payment.id };
+  switch (result.kind) {
+    case "paid":
+      log.info({ ...context, outcome: result.outcome }, "Payment succeeded");
       return;
-    }
-    case "FAILED":
-    case "CANCELLED":
-    case "TIMED_OUT": {
-      const outcome = await failPayment(deps.db, orderId);
-      deps.log.info(
+    case "failed":
+      log.info(
         {
-          orderId,
-          paymentId: payment.id,
+          ...context,
           paymentStatus: payment.status,
           reason: payment.result_desc,
-          outcome,
+          outcome: result.outcome,
         },
         "Payment did not go through",
       );
       return;
-    }
-    default:
+    case "amount_mismatch":
+      log.error(
+        { ...context, amount: result.amount, orderTotal: result.orderTotal },
+        "PayBridge payment amount doesn't match the order total; order flagged",
+      );
+      return;
+    case "no_order":
+      log.error(context, "Payment result for an order that doesn't exist");
+      return;
+    case "pending":
       return;
   }
 };
@@ -126,11 +128,11 @@ export const requestPayment = async (deps: PaymentDeps, orderId: string) => {
     case "accepted":
       await storePaymentId(deps.db, orderId, result.payment.id);
       // Normally PENDING; a callback can, rarely, settle it first.
-      await applyPaymentStatus(deps, orderId, order.total, result.payment);
+      await applyPaymentStatus(deps, orderId, result.payment);
       return;
     case "rejected":
       await storePaymentId(deps.db, orderId, result.payment.id);
-      await applyPaymentStatus(deps, orderId, order.total, result.payment);
+      await applyPaymentStatus(deps, orderId, result.payment);
       return;
     case "invalid":
       // Nothing will make PayBridge accept this order, so stop holding stock.
@@ -188,7 +190,7 @@ export const syncPayment = async (deps: PaymentDeps, orderId: string) => {
       );
       return;
     }
-    await applyPaymentStatus(deps, orderId, order.total, payment);
+    await applyPaymentStatus(deps, orderId, payment);
   } catch (err) {
     deps.log.warn({ err, orderId }, "Payment status sync failed");
   }
