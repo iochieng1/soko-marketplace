@@ -18,7 +18,7 @@ export const startOutboxWorker = (
 
   const tick = async () => {
     try {
-      await drainOutbox(deps);
+      await drainOutbox(deps, { shouldStop: () => stopped });
     } catch (err) {
       // A database blip: log it and try again next tick.
       deps.log.error({ err }, "Outbox worker tick failed");

@@ -2,7 +2,14 @@ import type { FastifyBaseLogger } from "fastify";
 
 /**
  * Outgoing email and SMS. Each method resolves once the provider has accepted
- * the message and throws otherwise, so the outbox worker can retry it.
+ * the message and throws otherwise. What it throws tells the outbox worker
+ * what to do next:
+ *   - `NotifierError`: may work later (an outage, a rate limit, a bad API
+ *     key someone will fix). Retried with backoff.
+ *   - `PermanentNotifierError`: this message will never be accepted (an
+ *     invalid address or number). Abandoned at once.
+ *   - `NotConfiguredError`: no provider for the channel yet. Kept queued
+ *     without using up an attempt.
  */
 export interface Notifier {
   email(message: EmailMessage): Promise<void>;
@@ -15,7 +22,8 @@ export interface EmailMessage {
   text: string;
   /**
    * Same key, same email: the provider sends it once even if we ask twice
-   * (a worker that crashed after sending but before recording it).
+   * (a worker that crashed after sending but before recording it). Must be
+   * unique across environments that share an API key.
    */
   idempotencyKey: string;
 }
@@ -28,6 +36,14 @@ export interface SmsMessage {
 
 export class NotifierError extends Error {
   override name = "NotifierError";
+}
+
+export class PermanentNotifierError extends NotifierError {
+  override name = "PermanentNotifierError";
+}
+
+export class NotConfiguredError extends NotifierError {
+  override name = "NotConfiguredError";
 }
 
 const TIMEOUT_MS = 10_000;
@@ -57,13 +73,20 @@ export const resendEmail = ({
       body: JSON.stringify({ from, to: [to], subject, text }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-    if (!res.ok) {
-      throw new NotifierError(
-        `Resend refused the email (${await describe(res)})`,
-      );
+    if (res.ok) return;
+    const message = `Resend refused the email (${await describe(res)})`;
+    // 400/422: this email is invalid (bad address, bad sender) and always
+    // will be. 401/403 (a bad key), 429 and 5xx can be fixed or wait out.
+    if (res.status === 400 || res.status === 422) {
+      throw new PermanentNotifierError(message);
     }
+    throw new NotifierError(message);
   };
 };
+
+/** Africa's Talking per-recipient codes. */
+const AT_ACCEPTED = new Set([100, 101, 102]); // Processed, Sent, Queued
+const AT_PERMANENT = new Set([403, 404, 406]); // InvalidPhoneNumber, UnsupportedNumberType, UserInBlacklist
 
 /**
  * Africa's Talking `POST /version1/messaging`. The username `sandbox` goes to
@@ -73,13 +96,15 @@ export const africasTalkingSms = ({
   username,
   apiKey,
   senderId,
+  log,
   baseUrl = username === "sandbox"
     ? "https://api.sandbox.africastalking.com"
     : "https://api.africastalking.com",
 }: {
   username: string;
   apiKey: string;
-  senderId?: string;
+  senderId?: string | undefined;
+  log?: FastifyBaseLogger | undefined;
   baseUrl?: string;
 }): Notifier["sms"] => {
   const url = `${baseUrl.replace(/\/+$/, "")}/version1/messaging`;
@@ -97,26 +122,35 @@ export const africasTalkingSms = ({
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) {
-      throw new NotifierError(
-        `Africa's Talking refused the SMS (${await describe(res)})`,
-      );
+      const error = `Africa's Talking refused the SMS (${await describe(res)})`;
+      if (res.status === 400) throw new PermanentNotifierError(error);
+      throw new NotifierError(error);
     }
-    // A 201 can still carry a per-recipient failure (bad number, no credit).
-    // 100 Processed, 101 Sent and 102 Queued are the accepted codes.
+
+    // A 2xx means the SMS was taken. The body can still report a
+    // per-recipient failure, and only an explicit failure code is acted on:
+    // an unreadable body after a 2xx is treated as sent, because retrying a
+    // message that probably went out would text the customer again (there's
+    // no idempotency key to stop it).
     const body = (await res.json().catch(() => null)) as {
       SMSMessageData?: {
-        Recipients?: { statusCode?: number; status?: string }[];
+        Recipients?: { statusCode?: unknown; status?: unknown }[];
       };
     } | null;
     const recipient = body?.SMSMessageData?.Recipients?.[0];
-    if (
-      !recipient?.statusCode ||
-      ![100, 101, 102].includes(recipient.statusCode)
-    ) {
-      throw new NotifierError(
-        `Africa's Talking didn't accept the SMS: ${recipient?.status ?? "no recipient in response"}`,
+    if (typeof recipient?.statusCode !== "number") {
+      log?.warn(
+        { status: res.status },
+        "Africa's Talking accepted the SMS but its response couldn't be read; treating it as sent",
       );
+      return;
     }
+    if (AT_ACCEPTED.has(recipient.statusCode)) return;
+    const error = `Africa's Talking didn't accept the SMS: ${String(recipient.status)} (${recipient.statusCode})`;
+    if (AT_PERMANENT.has(recipient.statusCode)) {
+      throw new PermanentNotifierError(error);
+    }
+    throw new NotifierError(error);
   };
 };
 
@@ -132,9 +166,9 @@ export interface NotifierConfig {
 /**
  * Builds the notifier from config. A channel without credentials:
  *   - in development and test, logs the message instead of sending it;
- *   - in production, throws, so its messages stay queued and the worker
- *     retries them and then gives up loudly. Nothing is marked sent that
- *     wasn't.
+ *   - in production, throws `NotConfiguredError`: its messages stay queued,
+ *     without using up attempts, and go out once credentials are set.
+ *     Nothing is marked sent that wasn't.
  */
 export const createNotifier = (
   config: NotifierConfig,
@@ -142,10 +176,15 @@ export const createNotifier = (
 ): Notifier => {
   const missing = (channel: string) => async (message: unknown) => {
     if (config.NODE_ENV === "production") {
-      throw new NotifierError(`No ${channel} provider is configured`);
+      throw new NotConfiguredError(`No ${channel} provider is configured`);
     }
     log.info({ channel, message }, `${channel} not configured; logged instead`);
   };
+
+  const emailReady = Boolean(config.RESEND_API_KEY);
+  const smsReady = Boolean(
+    config.AFRICASTALKING_USERNAME && config.AFRICASTALKING_API_KEY,
+  );
 
   const email = config.RESEND_API_KEY
     ? resendEmail({ apiKey: config.RESEND_API_KEY, from: config.EMAIL_FROM })
@@ -156,16 +195,19 @@ export const createNotifier = (
           username: config.AFRICASTALKING_USERNAME,
           apiKey: config.AFRICASTALKING_API_KEY,
           senderId: config.AFRICASTALKING_SENDER_ID,
+          log,
         })
       : missing("SMS");
 
   if (config.NODE_ENV === "production") {
-    if (!config.RESEND_API_KEY) {
-      log.warn("RESEND_API_KEY is not set: confirmation emails can't be sent");
-    }
-    if (!config.AFRICASTALKING_API_KEY) {
+    if (!emailReady) {
       log.warn(
-        "AFRICASTALKING_API_KEY is not set: confirmation SMS can't be sent",
+        "RESEND_API_KEY is not set: confirmation emails will wait in the outbox",
+      );
+    }
+    if (!smsReady) {
+      log.warn(
+        "AFRICASTALKING_USERNAME and AFRICASTALKING_API_KEY must both be set: confirmation SMS will wait in the outbox",
       );
     }
   }

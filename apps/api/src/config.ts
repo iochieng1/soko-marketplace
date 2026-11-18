@@ -1,10 +1,9 @@
 import { z } from "zod";
 
 // An empty value (`RESEND_API_KEY=` in .env) counts as not set.
-const optional = z.preprocess(
-  (value) => (value === "" ? undefined : value),
-  z.string().min(1).optional(),
-);
+const emptyAsUnset = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === "" ? undefined : value), schema);
+const optional = emptyAsUnset(z.string().min(1).optional());
 
 const envSchema = z.object({
   NODE_ENV: z
@@ -47,8 +46,7 @@ const envSchema = z.object({
   // Confirmation email via Resend. Without a key, emails are logged in
   // development and left queued (and retried) in production.
   RESEND_API_KEY: optional,
-  EMAIL_FROM: z.preprocess(
-    (value) => (value === "" ? undefined : value),
+  EMAIL_FROM: emptyAsUnset(
     z.string().min(3).default("Soko <onboarding@resend.dev>"),
   ),
   // Confirmation SMS via Africa's Talking. Username "sandbox" uses the

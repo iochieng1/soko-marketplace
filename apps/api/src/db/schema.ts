@@ -287,8 +287,9 @@ export const outbox = pgTable(
       .notNull()
       .defaultNow(),
     lastError: text("last_error"),
-    // Set when the worker gives up after too many attempts. The row stays for
-    // a person to look at (and re-queue by clearing it).
+    // Set when the worker gives up (too many attempts, or a message the
+    // provider will never accept). The row stays for a person to look at;
+    // requeueAbandoned() puts it back with a fresh set of attempts.
     failedAt: timestamp("failed_at", { withTimezone: true }),
   },
   (t) => [

@@ -7,6 +7,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   africasTalkingSms,
   createNotifier,
+  NotConfiguredError,
+  NotifierError,
+  PermanentNotifierError,
   resendEmail,
 } from "../src/lib/notifier.js";
 
@@ -60,9 +63,18 @@ describe("notifier providers", () => {
       });
     });
 
-    it("throws when Resend refuses it", async () => {
+    it("fails permanently on an email Resend will never accept", async () => {
       reply = { status: 422, body: { message: "Invalid `to` field" } };
-      await expect(send()).rejects.toThrow(/Resend refused the email \(422/);
+      const err = await send().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PermanentNotifierError);
+      expect(String(err)).toMatch(/Resend refused the email \(422/);
+    });
+
+    it.each([401, 429, 503])("fails retryably on a %i", async (status) => {
+      reply = { status, body: { message: "nope" } };
+      const err = await send().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NotifierError);
+      expect(err).not.toBeInstanceOf(PermanentNotifierError);
     });
   });
 
@@ -94,9 +106,23 @@ describe("notifier providers", () => {
       });
     });
 
-    it("throws when the recipient wasn't accepted, even on a 201", async () => {
+    it("fails permanently for an invalid number, even on a 201", async () => {
       reply = { status: 201, body: recipients(403, "InvalidPhoneNumber") };
-      await expect(send()).rejects.toThrow(/InvalidPhoneNumber/);
+      const err = await send().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PermanentNotifierError);
+      expect(String(err)).toMatch(/InvalidPhoneNumber/);
+    });
+
+    it("fails retryably when the account is out of credit", async () => {
+      reply = { status: 201, body: recipients(405, "InsufficientBalance") };
+      const err = await send().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NotifierError);
+      expect(err).not.toBeInstanceOf(PermanentNotifierError);
+    });
+
+    it("treats a 2xx it can't read as sent, so the customer isn't texted again", async () => {
+      reply = { status: 201, body: "OK" };
+      await expect(send()).resolves.toBeUndefined();
     });
 
     it("throws on an HTTP error", async () => {
@@ -127,12 +153,27 @@ describe("notifier providers", () => {
         { NODE_ENV: "production", EMAIL_FROM: "x@y.z" },
         log,
       );
-      await expect(notifier.sms(message)).rejects.toThrow(
-        /No SMS provider is configured/,
+      await expect(notifier.sms(message)).rejects.toBeInstanceOf(
+        NotConfiguredError,
       );
       expect(logs).toContain(
-        "RESEND_API_KEY is not set: confirmation emails can't be sent",
+        "RESEND_API_KEY is not set: confirmation emails will wait in the outbox",
       );
+    });
+    it("warns when only the SMS API key is set", () => {
+      logs.length = 0;
+      createNotifier(
+        {
+          NODE_ENV: "production",
+          EMAIL_FROM: "x@y.z",
+          RESEND_API_KEY: "re_x",
+          AFRICASTALKING_API_KEY: "at_x",
+        },
+        log,
+      );
+      expect(logs).toEqual([
+        "AFRICASTALKING_USERNAME and AFRICASTALKING_API_KEY must both be set: confirmation SMS will wait in the outbox",
+      ]);
     });
   });
 });

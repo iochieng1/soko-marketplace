@@ -9,10 +9,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { createDb, type Database } from "../src/db/client.js";
 import { outbox } from "../src/db/schema.js";
-import type {
-  EmailMessage,
-  Notifier,
-  SmsMessage,
+import {
+  type EmailMessage,
+  NotConfiguredError,
+  type Notifier,
+  PermanentNotifierError,
+  type SmsMessage,
 } from "../src/lib/notifier.js";
 import {
   drainOutbox,
@@ -21,6 +23,7 @@ import {
   type OrderConfirmationPayload,
   type OutboxWorkerDeps,
   processOutboxOnce,
+  requeueAbandoned,
 } from "../src/lib/outbox.js";
 import { paymentReference } from "../src/lib/payment-sync.js";
 import { createIsolatedDatabase } from "./helpers.js";
@@ -69,8 +72,11 @@ const CRASH_WORKER = fileURLToPath(
 
 const ORDER_ID = "0b6f3c2e-5d4a-4f1e-9a7b-2c8d9e0f1a2b";
 
-const payload = (to: string): OrderConfirmationPayload => ({
-  order_id: ORDER_ID,
+const payload = (
+  to: string,
+  orderId: string = crypto.randomUUID(),
+): OrderConfirmationPayload => ({
+  order_id: orderId,
   to,
   total: 4500,
   items: [
@@ -105,8 +111,14 @@ describe("outbox worker", () => {
       .insert(outbox)
       .values({ type, payload: body })
       .returning({ id: outbox.id });
+    const orderId = (body as { order_id?: unknown }).order_id;
+    if (typeof orderId === "string") orderIds.set(row!.id, orderId);
     return row!.id;
   };
+
+  const orderIds = new Map<number, string>();
+  /** The Resend idempotency key the row's email is sent with. */
+  const keyOf = (id: number) => `order-confirmation-email-${orderIds.get(id)}`;
 
   const rowOf = async (id: number) => {
     const [r] = await db.select().from(outbox).where(eq(outbox.id, id));
@@ -125,16 +137,20 @@ describe("outbox worker", () => {
   });
 
   it("sends the confirmation email and SMS and marks each row processed", async () => {
-    const emailId = await enqueue();
+    const emailId = await enqueue(
+      ORDER_CONFIRMATION_EMAIL,
+      payload("wanjiru@example.co.ke", ORDER_ID),
+    );
     const smsId = await enqueue(
       ORDER_CONFIRMATION_SMS,
-      payload("254712345678"),
+      payload("254712345678", ORDER_ID),
     );
     const { notifier, sent } = fakeNotifier();
 
     expect(await drainOutbox(deps(notifier))).toEqual({
       sent: 2,
       retry: 0,
+      deferred: 0,
       gave_up: 0,
     });
 
@@ -145,7 +161,7 @@ describe("outbox worker", () => {
         to: "wanjiru@example.co.ke",
         subject: `Order ${reference} is confirmed`,
         text: expect.stringContaining("Total paid: KES 4,500"),
-        idempotencyKey: `soko-outbox-${emailId}`,
+        idempotencyKey: keyOf(emailId),
       },
       {
         channel: "sms",
@@ -216,7 +232,7 @@ describe("outbox worker", () => {
       expect((sent[0] as EmailMessage).idempotencyKey).toBe(
         firstSend.idempotencyKey,
       );
-      expect(firstSend.idempotencyKey).toBe(`soko-outbox-${id}`);
+      expect(firstSend.idempotencyKey).toBe(keyOf(id));
     });
   });
 
@@ -241,10 +257,10 @@ describe("outbox worker", () => {
       expect(await workerA).toBe("sent");
 
       expect(a.sent.map((m) => (m as EmailMessage).idempotencyKey)).toEqual([
-        `soko-outbox-${firstId}`,
+        keyOf(firstId),
       ]);
       expect(b.sent.map((m) => (m as EmailMessage).idempotencyKey)).toEqual([
-        `soko-outbox-${secondId}`,
+        keyOf(secondId),
       ]);
     });
 
@@ -263,7 +279,7 @@ describe("outbox worker", () => {
       const keys = [...a.sent, ...b.sent].map(
         (m) => (m as EmailMessage).idempotencyKey,
       );
-      expect(keys.sort()).toEqual(ids.map((id) => `soko-outbox-${id}`).sort());
+      expect(keys.sort()).toEqual(ids.map((id) => keyOf(id)).sort());
       expect(new Set(keys).size).toBe(12);
       expect(a.sent.length).toBeGreaterThan(0);
       expect(b.sent.length).toBeGreaterThan(0);
@@ -314,7 +330,12 @@ describe("outbox worker", () => {
         deps(notifier, { log, maxAttempts: 3, backoffMs: () => 0 }),
       );
 
-      expect(counts).toEqual({ sent: 0, retry: 2, gave_up: 1 });
+      expect(counts).toEqual({
+        sent: 0,
+        retry: 2,
+        deferred: 0,
+        gave_up: 1,
+      });
       const row = await rowOf(id);
       expect(row.attempts).toBe(3);
       expect(row.failedAt).toBeInstanceOf(Date);
@@ -337,6 +358,7 @@ describe("outbox worker", () => {
       expect(await drainOutbox(deps(notifier))).toEqual({
         sent: 0,
         retry: 0,
+        deferred: 0,
         gave_up: 2,
       });
       expect(sent).toHaveLength(0);
@@ -362,6 +384,90 @@ describe("outbox worker", () => {
         [failing, 1, false],
         [fine, 1, true],
       ]);
+    });
+  });
+
+  describe("review fixes", () => {
+    it("keeps messages for an unconfigured channel queued without using attempts", async () => {
+      const id = await enqueue();
+      const { notifier } = fakeNotifier(() => {
+        throw new NotConfiguredError("No email provider is configured");
+      });
+
+      for (let i = 0; i < 3; i++) {
+        await db
+          .update(outbox)
+          .set({ nextAttemptAt: sql`now()` })
+          .where(eq(outbox.id, id));
+        expect(
+          await processOutboxOnce(deps(notifier, { maxAttempts: 2 })),
+        ).toBe("deferred");
+      }
+
+      const row = await rowOf(id);
+      expect(row.attempts).toBe(0);
+      expect(row.failedAt).toBeNull();
+      expect(row.lastError).toBe("No email provider is configured");
+
+      // Once the provider is set up, it goes out.
+      await db
+        .update(outbox)
+        .set({ nextAttemptAt: sql`now()` })
+        .where(eq(outbox.id, id));
+      const configured = fakeNotifier();
+      expect(await processOutboxOnce(deps(configured.notifier))).toBe("sent");
+    });
+
+    it("abandons at once a message the provider will never accept", async () => {
+      const id = await enqueue();
+      const { notifier } = fakeNotifier(() => {
+        throw new PermanentNotifierError(
+          "Resend refused the email (422: bad to)",
+        );
+      });
+
+      expect(await processOutboxOnce(deps(notifier))).toBe("gave_up");
+      expect((await rowOf(id)).attempts).toBe(1);
+      expect((await rowOf(id)).failedAt).toBeInstanceOf(Date);
+    });
+
+    it("stops between messages when asked to", async () => {
+      for (let i = 0; i < 5; i++) await enqueue();
+      let stop = false;
+      const { notifier, sent } = fakeNotifier(() => {
+        stop = true;
+      });
+
+      const counts = await drainOutbox(deps(notifier), {
+        shouldStop: () => stop,
+      });
+
+      expect(counts.sent).toBe(1);
+      expect(sent).toHaveLength(1);
+    });
+
+    it("re-queues abandoned messages with a fresh set of attempts", async () => {
+      const id = await enqueue();
+      const failing = fakeNotifier(() => {
+        throw new Error("down");
+      });
+      await drainOutbox(
+        deps(failing.notifier, { maxAttempts: 2, backoffMs: () => 0 }),
+      );
+      expect((await rowOf(id)).failedAt).toBeInstanceOf(Date);
+
+      expect(await requeueAbandoned(db)).toEqual([id]);
+      const row = await rowOf(id);
+      expect(row.failedAt).toBeNull();
+      expect(row.attempts).toBe(0);
+
+      // One transient failure no longer abandons it straight away.
+      const flaky = fakeNotifier(() => {
+        throw new Error("503");
+      });
+      expect(
+        await processOutboxOnce(deps(flaky.notifier, { maxAttempts: 2 })),
+      ).toBe("retry");
     });
   });
 });
